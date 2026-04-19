@@ -54,5 +54,32 @@ func setupMounts() error {
 	if err := unix.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
 		return fmt.Errorf("mount /sys: %w", err)
 	}
+	if err := createDevNodes(); err != nil {
+		return fmt.Errorf("create /dev nodes: %w", err)
+	}
+	return nil
+}
+
+func createDevNodes() error {
+	nodes := []struct {
+		path  string
+		mode  uint32
+		major uint32
+		minor uint32
+	}{
+		{"/dev/null", unix.S_IFCHR | 0666, 1, 3},
+		{"/dev/zero", unix.S_IFCHR | 0666, 1, 5},
+		{"/dev/full", unix.S_IFCHR | 0666, 1, 7},
+		{"/dev/random", unix.S_IFCHR | 0666, 1, 8},
+		{"/dev/urandom", unix.S_IFCHR | 0666, 1, 9},
+		{"/dev/tty", unix.S_IFCHR | 0666, 5, 0},
+	}
+
+	for _, n := range nodes {
+		dev := unix.Mkdev(n.major, n.minor)
+		if err := unix.Mknod(n.path, n.mode, int(dev)); err != nil {
+			return fmt.Errorf("mknod %s: %w", n.path, err)
+		}
+	}
 	return nil
 }
