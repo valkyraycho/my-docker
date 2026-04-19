@@ -17,16 +17,22 @@ func main() {
 
 	switch os.Args[1] {
 	case "run":
-		if len(os.Args) < 3 {
+		if len(os.Args) < 4 {
 			fmt.Fprintf(os.Stderr, "usage: mydocker run <cmd> [args...]\n")
 			os.Exit(1)
 		}
-		if err := container.Run(os.Args[2:]); err != nil {
+
+		rootfs := os.Args[2]
+		cmd := os.Args[3:]
+
+		if err := container.Run(rootfs, cmd); err != nil {
 			fmt.Fprintf(os.Stderr, "run: %v\n", err)
 			os.Exit(1)
 		}
 	case "init":
-		if err := container.Init(os.Args[2:]); err != nil {
+		rootfs := os.Args[2]
+		cmd := os.Args[3:]
+		if err := container.Init(rootfs, cmd); err != nil {
 			fmt.Fprintf(os.Stderr, "init: %v\n", err)
 			os.Exit(1)
 		}

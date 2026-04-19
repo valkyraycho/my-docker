@@ -8,8 +8,8 @@ import (
 	"syscall"
 )
 
-func Run(args []string) error {
-	cmd := exec.Command("/proc/self/exe", append([]string{"init"}, args...)...)
+func Run(rootfs string, args []string) error {
+	cmd := exec.Command("/proc/self/exe", append([]string{"init", rootfs}, args...)...)
 
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
