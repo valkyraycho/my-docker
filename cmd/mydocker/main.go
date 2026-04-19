@@ -3,12 +3,15 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 
 	"github.com/valkyraycho/my-docker/internal/cgroup"
 	"github.com/valkyraycho/my-docker/internal/container"
+	"github.com/valkyraycho/my-docker/internal/overlay"
 )
 
 func main() {
@@ -39,12 +42,30 @@ func runCommand(args []string) {
 
 	posArgs := fs.Args()
 	if len(posArgs) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: mydocker run [flags] <rootfs> <cmd> [args...]\n")
+		fmt.Fprintf(os.Stderr, "usage: mydocker run [flags] <layer> <cmd> [args...]\n")
 		os.Exit(1)
 	}
 
-	rootfs := posArgs[0]
+	if err := overlay.EnsureRoot(); err != nil {
+		fmt.Fprintf(os.Stderr, "setup: %v\n", err)
+		os.Exit(1)
+	}
+
+	containerID := generateID()
+
+	layer := posArgs[0]
 	cmdArgs := posArgs[1:]
+
+	mergedPath, err := overlay.Mount(containerID, []string{layer})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mount: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := overlay.Unmount(containerID); err != nil {
+			fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
+		}
+	}()
 
 	limits := cgroup.Limits{
 		MemoryBytes: int64(*memMB) * 1024 * 1024,
@@ -52,10 +73,16 @@ func runCommand(args []string) {
 		PidsMax:     *pidsMax,
 	}
 
-	if err := container.Run(rootfs, limits, cmdArgs); err != nil {
+	if err := container.Run(containerID, mergedPath, limits, cmdArgs); err != nil {
 		fmt.Fprintf(os.Stderr, "run: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func generateID() string {
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func initCommand(args []string) {

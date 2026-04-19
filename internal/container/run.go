@@ -3,8 +3,6 @@
 package container
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,8 +11,7 @@ import (
 	"github.com/valkyraycho/my-docker/internal/cgroup"
 )
 
-func Run(rootfs string, limits cgroup.Limits, args []string) error {
-	id := generateID()
+func Run(containerID string, rootfs string, limits cgroup.Limits, args []string) error {
 	cmd := exec.Command("/proc/self/exe", append([]string{"init", rootfs}, args...)...)
 
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -23,7 +20,7 @@ func Run(rootfs string, limits cgroup.Limits, args []string) error {
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC,
 	}
 
-	cg := cgroup.New(id)
+	cg := cgroup.New(containerID)
 	if err := cg.Create(limits); err != nil {
 		return fmt.Errorf("create cgroup: %w", err)
 	}
@@ -38,10 +35,4 @@ func Run(rootfs string, limits cgroup.Limits, args []string) error {
 	}
 
 	return cmd.Wait()
-}
-
-func generateID() string {
-	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }
