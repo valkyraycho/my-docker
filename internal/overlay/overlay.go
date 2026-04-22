@@ -22,24 +22,24 @@ const (
 )
 
 func EnsureRoot() error {
-	if err := os.MkdirAll(root, 0755); err != nil {
-		return fmt.Errorf("create root dir: %w", err)
+	for _, d := range []string{root, layersDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", d, err)
+		}
 	}
 
-	mounted, err := isTmpfs(root)
+	if err := os.MkdirAll(containersDir, 0755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", containersDir, err)
+	}
+
+	mounted, err := isTmpfs(containersDir)
 	if err != nil {
 		return fmt.Errorf("check mount: %w", err)
 	}
 
 	if !mounted {
-		if err := unix.Mount("tmpfs", root, "tmpfs", 0, ""); err != nil {
+		if err := unix.Mount("tmpfs", containersDir, "tmpfs", 0, ""); err != nil {
 			return fmt.Errorf("mount tmpfs on %s: %w", root, err)
-		}
-	}
-
-	for _, d := range []string{layersDir, containersDir} {
-		if err := os.MkdirAll(d, 0755); err != nil {
-			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
 	}
 

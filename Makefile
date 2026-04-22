@@ -7,4 +7,4 @@ test-container:
 	docker run --rm -it --privileged \
 		-v $(PWD)/bin:/usr/local/bin \
 		-v $(PWD)/rootfs-cache:/rootfs-cache \
-		ubuntu:24.04 bash
+		mydocker-vm:latest bash

@@ -11,7 +11,9 @@ import (
 
 	"github.com/valkyraycho/my-docker/internal/cgroup"
 	"github.com/valkyraycho/my-docker/internal/container"
+	"github.com/valkyraycho/my-docker/internal/image"
 	"github.com/valkyraycho/my-docker/internal/overlay"
+	"github.com/valkyraycho/my-docker/internal/registry"
 )
 
 func main() {
@@ -25,6 +27,8 @@ func main() {
 		runCommand(os.Args[2:])
 	case "init":
 		initCommand(os.Args[2:])
+	case "pull":
+		pullCommand(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -98,4 +102,21 @@ func initCommand(args []string) {
 		fmt.Fprintf(os.Stderr, "init: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func pullCommand(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: mydocker pull <image>[:<tag>]\n")
+		os.Exit(1)
+	}
+
+	ref := args[0]
+	client := registry.New(image.DefaultRegistry)
+	store := image.New()
+
+	if err := store.Pull(client, ref); err != nil {
+		fmt.Fprintf(os.Stderr, "pull: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("pulled %s\n", ref)
 }
