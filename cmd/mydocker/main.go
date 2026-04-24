@@ -40,6 +40,7 @@ func runCommand(args []string) {
 	memMB := fs.Int("memory", 0, "memory limit in MB (0 = no limit)")
 	cpuPct := fs.Int("cpu", 0, "cpu limit as percent (0 = no limit)")
 	pidsMax := fs.Int("pids", 0, "max processes (0 = no limit)")
+	detach := fs.Bool("d", false, "run container in background")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
@@ -57,19 +58,28 @@ func runCommand(args []string) {
 
 	containerID := generateID()
 
-	layer := posArgs[0]
+	ref := posArgs[0]
 	cmdArgs := posArgs[1:]
 
-	mergedPath, err := overlay.Mount(containerID, []string{layer})
+	store := image.New()
+	layers, err := store.Resolve(ref)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolve: %v\n", err)
+		os.Exit(1)
+	}
+
+	mergedPath, err := overlay.Mount(containerID, layers)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mount: %v\n", err)
 		os.Exit(1)
 	}
-	defer func() {
-		if err := overlay.Unmount(containerID); err != nil {
-			fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
-		}
-	}()
+	if !*detach {
+		defer func() {
+			if err := overlay.Unmount(containerID); err != nil {
+				fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
+			}
+		}()
+	}
 
 	limits := cgroup.Limits{
 		MemoryBytes: int64(*memMB) * 1024 * 1024,
@@ -77,9 +87,23 @@ func runCommand(args []string) {
 		PidsMax:     *pidsMax,
 	}
 
-	if err := container.Run(containerID, mergedPath, limits, cmdArgs); err != nil {
+	opts := container.RunOptions{
+		ContainerID: containerID,
+		Image:       ref,
+		Layers:      layers,
+		Rootfs:      mergedPath,
+		Limits:      limits,
+		Args:        cmdArgs,
+		Detach:      *detach,
+	}
+
+	if err := container.Run(opts); err != nil {
 		fmt.Fprintf(os.Stderr, "run: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *detach {
+		fmt.Println(containerID)
 	}
 }
 
