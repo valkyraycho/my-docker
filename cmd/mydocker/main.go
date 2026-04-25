@@ -37,6 +37,8 @@ func main() {
 		logsCommand(os.Args[2:])
 	case "stop":
 		stopCommand(os.Args[2:])
+	case "rm":
+		rmCommand(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -209,6 +211,28 @@ func stopCommand(args []string) {
 	}
 	if err := container.Stop(posArgs[0], *timeout); err != nil {
 		fmt.Fprintf(os.Stderr, "stop: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(posArgs[0])
+}
+
+func rmCommand(args []string) {
+	fs := flag.NewFlagSet("rm", flag.ExitOnError)
+	force := fs.Bool("f", false, "force removal (stops if running)")
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	posArgs := fs.Args()
+	if len(posArgs) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: mydocker rm [-f] <id>\n")
+		os.Exit(1)
+	}
+
+	if err := container.Rm(posArgs[0], *force); err != nil {
+		fmt.Fprintf(os.Stderr, "rm: %v\n", err)
 		os.Exit(1)
 	}
 

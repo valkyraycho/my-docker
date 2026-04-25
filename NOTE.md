@@ -599,7 +599,472 @@ Two general-form lessons emerge:
 
 ---
 
-## Putting it all together — the two commands' lives
+## Milestone 6 — Container Lifecycle (`run -d`, `ps`, `logs`, `stop`, `rm`)
+
+**The shift in mental model:** up through M5, a container was a *function call* — `Run()` blocks until the workload exits, then tears everything down. M6 makes a container a **managed resource with a lifecycle**: it's created, runs (maybe in the background), eventually exits, and stays listable/inspectable until someone removes it.
+
+This requires three things we didn't have before:
+
+1. **Persistent state** — a record of every container that ever ran, not just the one in front of us right now.
+2. **Identity that survives the process** — so a later `mydocker stop abc` can find the right PID and send it a signal safely.
+3. **A "PID 1"** — a real init process inside the container that owns signal forwarding and (in principle) zombie reaping.
+
+The rest of M6 is how each piece falls out of those three requirements.
+
+---
+
+### 6a · The state package — who's alive, what ran, how it ended
+
+```
+internal/state/
+├── state.go     ← Container struct + Save/Load
+├── proc.go      ← ReadStartTime, IsRunning (the PID-reuse defense)
+└── registry.go  ← List (scan dir), Find (prefix match)
+```
+
+#### The `Container` struct — what we persist
+
+```go
+// internal/state/state.go
+type Container struct {
+    // Identity
+    ID      string   // 12-char hex generated at run-time
+    Image   string   // "library/alpine:3.19" — for display
+    Layers  []string // digest paths, already in top-first order
+    Command []string // argv for `ps` display
+
+    // Runtime identity — the (PID, StartTime) tuple
+    PID       int
+    StartTime uint64 // /proc/<pid>/stat field 22 (jiffies since boot)
+
+    // Lifecycle
+    Status     string    // "running" | "exited"
+    ExitCode   int
+    CreatedAt, StartedAt, FinishedAt time.Time
+}
+```
+
+Saved as pretty-printed JSON at `/var/lib/mydocker/containers/<id>/state.json`. One file per container. No database, no index — just a directory of JSON files.
+
+#### The `(PID, StartTime)` tuple — defending against PID reuse
+
+This is the most important idea in M6. **PIDs get reused.** After process 12345 exits, the kernel will eventually assign 12345 to someone else — maybe your browser, maybe a daemon. If we stored only the PID and later did `kill(12345, SIGTERM)`, we'd SIGTERM *whatever* has PID 12345 right now, not our container. Catastrophic.
+
+The fix: record a **second coordinate** that's unique-per-process and doesn't collide under reuse — the process's **start time**, measured in jiffies since boot. Linux exposes this as field 22 of `/proc/<pid>/stat`:
+
+```go
+// internal/state/proc.go
+func ReadStartTime(pid int) (uint64, error) {
+    b, _ := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+    s := string(b)
+
+    // /proc/<pid>/stat looks like:
+    //   1234 (comm name with spaces) R 1 1234 1234 ...
+    //                                ^ we split from here
+    // Field 2 — the `(comm)` — can contain spaces AND parentheses.
+    // Safe split: find the LAST ')'.
+    lastParamIdx := strings.LastIndexByte(s, ')')
+    tail := s[lastParamIdx+2:]
+    fields := strings.Fields(tail)
+    // After the ')', field 22 becomes index 19 (we removed the first two).
+    return strconv.ParseUint(fields[19], 10, 64)
+}
+
+func IsRunning(pid int, wantStart uint64) bool {
+    gotStart, err := ReadStartTime(pid)
+    if err != nil { return false }       // stat missing → process gone
+    return gotStart == wantStart          // same PID + same start time → really us
+}
+```
+
+`★ Insight ─────────────────────────────────────`
+- **Why "last `)`", not "second `)`":** the `comm` field is whatever the process named itself — a user could literally `prctl(PR_SET_NAME, "evil) 1 2 3 4 ...")` and inject fake fields. This is the hardening note every kernel parser has. `LastIndexByte(s, ')')` guarantees we're past the adversary-controlled section.
+- **Why jiffies and not wall-clock time:** jiffies since boot are monotonic — they can't go backwards, survive clock adjustments, and are the kernel's own internal measure. Wall clock (`CreatedAt`) is for humans; jiffies are for correctness.
+- **This `(pid, start_time)` pattern is the standard process-identity trick** used by systemd (`PIDFDFSelfRef`), Kubernetes' kubelet, and tini. Internalize it — you'll recognize it everywhere once you know to look.
+`─────────────────────────────────────────────────`
+
+#### Atomic save
+
+The same temp-file-then-rename trick you saw in M5:
+
+```go
+// internal/state/state.go — Save
+b, _ := json.MarshalIndent(c, "", "  ")
+os.WriteFile(tmpStatePath, b, 0644)
+os.Rename(tmpStatePath, statePath)    // atomic on same filesystem
+```
+
+A crash mid-write leaves a `.tmp` file, not a half-written `state.json`. A reader never sees a partially-written file.
+
+#### Prefix-match ID lookup — the UX polish
+
+Docker lets you type `docker stop a3f` instead of the full 12+ char ID. `state.Find` replicates this:
+
+```go
+// internal/state/registry.go — Find
+matches := []*Container{...everyone whose ID starts with prefix...}
+switch len(matches) {
+case 0:  return nil, fmt.Errorf("no such container: %s", prefix)
+case 1:  return matches[0], nil
+default: return nil, fmt.Errorf("ambiguous prefix %q matches %d containers: %s", ...)
+}
+```
+
+The three-way return is a good instinct: unambiguously succeed, cleanly fail, **refuse ambiguity** rather than guessing. Silently picking the "first" match is the kind of fallback that bites you at 3am.
+
+---
+
+### 6b · `image.Resolve` — running from a local image, not a layer digest
+
+Before M6, `run` took a layer *directory name* as its positional. Now it takes an image ref (`alpine:3.19`) and we resolve it.
+
+```go
+// internal/image/resolve.go
+func (s *Store) Resolve(ref string) ([]string, error) {
+    repo, tag := parseRef(ref)
+
+    manifestBytes, err := os.ReadFile(filepath.Join(s.ImageDir(repo, tag), "manifest.json"))
+    if errors.Is(err, os.ErrNotExist) {
+        return nil, fmt.Errorf("image %q not found: %w", ref, ErrImageNotFound)
+    }
+
+    var manifest registry.Manifest
+    json.Unmarshal(manifestBytes, &manifest)
+
+    // Reverse: manifest lists base→top; overlayfs wants top→base in lowerdir.
+    result := make([]string, len(manifest.Layers))
+    for i, layer := range manifest.Layers {
+        result[len(manifest.Layers)-i-1] = digestPath(layer.Digest)
+    }
+    return result, nil
+}
+```
+
+Two things worth naming:
+
+1. **The reversed layer order** answers one of the open questions from M4: overlayfs's `lowerdir=a:b:c` resolves files top-down (first listed wins), but OCI manifests list layers *bottom-up* (base image first, app layer last). So we reverse. Getting this wrong silently masks files with older versions of themselves.
+2. **`ErrImageNotFound` as a sentinel error** — `run` catches this specifically and auto-pulls:
+
+    ```go
+    // cmd/mydocker/main.go — runCommand
+    layers, err := store.Resolve(ref)
+    if errors.Is(err, image.ErrImageNotFound) {
+        fmt.Fprintf(os.Stderr, "image %q not found locally, pulling...\n", ref)
+        store.Pull(client, ref)
+        layers, err = store.Resolve(ref)
+    }
+    ```
+
+   Matches `docker run`'s behavior of transparently pulling missing images. Using a sentinel (rather than string-matching the error message) is the right call — it survives error-message rewording.
+
+---
+
+### 6c · Detach mode (`run -d`) — the five differences from foreground
+
+Most of the `-d` logic lives in `run.go`. Reading the diff between foreground and detached paths is a great exercise in understanding what "running in the background" actually *means*:
+
+```go
+// internal/container/run.go
+if opts.Detach {
+    // Difference 1: stdout/stderr → log files (not terminal)
+    stdoutLog, _ := os.OpenFile(state.StdoutPath(opts.ContainerID), ...)
+    stderrLog, _ := os.OpenFile(state.StderrPath(opts.ContainerID), ...)
+    cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, stdoutLog, stderrLog
+
+    // Difference 2: Setsid — start a new session, detach from parent's controlling terminal
+    cmd.SysProcAttr.Setsid = true
+} else {
+    cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+}
+
+// ... Start, cgroup add, state save ...
+
+if opts.Detach {
+    return nil     // Difference 3: don't Wait — exit and leave the child running
+}
+// foreground path: Wait, update state on exit, defer cleanup
+```
+
+And over in `cmd/mydocker/main.go`:
+
+```go
+if !*detach {
+    defer overlay.Unmount(containerID)    // Difference 4: skip unmount in detach
+}
+// ... Run ...
+if *detach {
+    fmt.Println(containerID)              // Difference 5: print the ID, like `docker run -d`
+}
+```
+
+**Why `Setsid: true` is non-negotiable for detach:** without it, the container process stays in the parent shell's *session*. When the user closes the terminal, the kernel sends `SIGHUP` to the session leader, which propagates to every process in the session — including your "detached" container. It dies the moment you close the terminal.
+
+`Setsid` creates a new session with the child as session leader, severing that link. This is what `nohup`, `setsid(1)`, and every well-behaved daemon does.
+
+**Why we skip `overlay.Unmount` in detach:** in foreground mode, `defer overlay.Unmount(id)` fires when the user's process exits. In detach, the parent returns *immediately* after `cmd.Start()` — the child is still running. Unmounting now would pull the filesystem out from under a live container. Cleanup is deferred until `rm`.
+
+**Also notice what `Unmount` no longer does:**
+
+```go
+// internal/overlay/overlay.go — Unmount (post-M6)
+func Unmount(containerID string) error {
+    // ... unmount the overlay ...
+    // NOTE: used to also RemoveAll(containerDir). Now only state.RemoveDir does that,
+    // because containerDir holds state.json + stdout.log + stderr.log — we can't
+    // delete them when a foreground container exits; they must survive until `rm`.
+    return nil
+}
+```
+
+A small refactor with big consequences: responsibility for removing the state directory moved to `rm.go`. Foreground containers now leave their state behind after exit — which is exactly what lets you `mydocker ps -a` to see exited containers, and `mydocker logs <id>` after the fact (for detached ones).
+
+---
+
+### 6d · `init.go` — becoming a real PID 1
+
+Before M6:
+
+```go
+// old: the init binary REPLACES itself with the user's command
+return unix.Exec(binary, args, os.Environ())
+```
+
+After M6:
+
+```go
+// new: init STAYS ALIVE as PID 1 and spawns the user command as a child
+cmd := exec.Command(binary, args[1:]...)
+cmd.Start()
+
+sigCh := make(chan os.Signal, 1)
+signal.Notify(sigCh, SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGUSR1, SIGUSR2)
+go func() {
+    for sig := range sigCh { _ = cmd.Process.Signal(sig) }
+}()
+
+err = cmd.Wait()
+os.Exit(cmd.ProcessState.ExitCode())
+```
+
+**Why the change?** In a container with `CLONE_NEWPID`, the first process *is* PID 1 — the kernel's init process from that namespace's perspective. PID 1 has special responsibilities:
+
+1. **Signal default handlers don't apply.** The kernel refuses to deliver signals whose only handler is the default to PID 1. If init doesn't explicitly register a handler for `SIGTERM`, `kill 1` does *nothing*. That's why `docker stop` on a naive image often seems to hang for 10 seconds then SIGKILL.
+2. **Orphan reaping.** When a process's parent dies, its children re-parent to PID 1, which must `wait()` for them when they exit. Without reaping, zombies accumulate until you run out of PIDs.
+
+Our new `Init` handles #1 (signal forwarding for a long list of signals) but only partially handles #2 — `cmd.Wait()` reaps the *direct* child only. If the user's workload forks grandchildren that later get orphaned, they re-parent to our init and become zombies that nothing reaps. A fully-correct init would loop `syscall.Wait4(-1, ..., WNOHANG, nil)` on every `SIGCHLD`. This is exactly what `tini` and `dumb-init` exist to do.
+
+**Why that's OK for M6:** our containers are mostly `sh` or short-lived commands. The common case is no grandchildren, and if there are, they die when `sh` does. The limitation is real but minor — noted as an open question.
+
+> **Junior-dev gotcha to internalize:** "PID 1 is special" is not a rule you'll find from reading userspace code — it's kernel behavior. When you inherit a container that "mysteriously doesn't respond to SIGTERM," the answer is almost always: no signal handler on PID 1.
+
+---
+
+### 6e · `ps` — list + lazy reconciliation
+
+```go
+// internal/container/ps.go
+func Ps(w io.Writer, showAll bool) error {
+    containers, _ := state.List()
+
+    // Reconciliation: state says "running" but the process is actually gone
+    for _, c := range containers {
+        if c.Status == state.StatusRunning && !state.IsRunning(c.PID, c.StartTime) {
+            c.Status = state.StatusExited
+            c.FinishedAt = time.Now()
+            c.Save()
+        }
+    }
+
+    // tabwriter gives aligned columns without manual padding
+    tw := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
+    fmt.Fprintln(tw, "CONTAINER ID\tIMAGE\tCOMMAND\tSTATUS\tCREATED")
+    for _, c := range containers {
+        if !showAll && c.Status != state.StatusRunning { continue }
+        fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", shortID(c.ID), ...)
+    }
+    return tw.Flush()
+}
+```
+
+**The reconciliation insight:** state is *eventually consistent*, not live. A foreground container exited cleanly → `Run()` updated its state to "exited". But:
+
+- If `mydocker` itself was killed (e.g., Ctrl-\), the child kept running and nobody updated state.
+- In detach mode, the child can exit at any time; we're not watching.
+- `FinishedAt = time.Now()` here is approximate — we're stamping the time *we noticed*, not when it actually died. Good enough for humans; wrong for forensics.
+
+So `ps` heals the state on every invocation. Any command that lists containers is a good place to do this — it's cheap (one `open()` per PID) and amortizes the cost across natural user actions.
+
+`★ Insight ─────────────────────────────────────`
+**"Lazy reconciliation at read time"** is how a huge class of distributed systems avoid background reaper threads. Kubernetes does it, etcd does it, your container runtime does it. The principle: "don't spend CPU tracking state changes you don't need to react to immediately; detect them when you care." For a single-binary CLI tool, no reaper daemon is absolutely the right call.
+`─────────────────────────────────────────────────`
+
+---
+
+### 6f · `logs` — just copy the file
+
+```go
+// internal/container/logs.go
+func Logs(w io.Writer, prefix string) error {
+    c, _ := state.Find(prefix)
+
+    f, err := os.Open(state.StdoutPath(c.ID))
+    if err != nil {
+        return fmt.Errorf("no logs for %s — foreground container?", c.ID)
+    }
+    defer f.Close()
+
+    _, err = io.Copy(w, f)
+    return err
+}
+```
+
+Almost trivially short, because **the hard work was done in `run.go`**: redirecting stdout/stderr to `stdout.log`/`stderr.log` at start time means `logs` is just `cat`.
+
+The error message when the log file is missing is deliberately diagnostic, not just `"file not found"`. Why? Because there's exactly one case where this fails: the container ran in foreground and therefore wrote to the terminal, not to a file. Telling the user *why* saves them a round trip of "why doesn't my log file exist?". **Always write error messages that answer the next question.**
+
+Limitation noted: `io.Copy` reads to EOF and returns. We don't support `docker logs -f` (follow/tail). Adding that would mean `inotify` or a polling loop — a natural M6.5 exercise.
+
+---
+
+### 6g · `stop` — the TERM-wait-KILL dance
+
+```go
+// internal/container/stop.go
+const DefaultStopTimeout = 10 * time.Second
+
+func Stop(prefix string, timeout time.Duration) error {
+    c, _ := state.Find(prefix)
+
+    if !state.IsRunning(c.PID, c.StartTime) {
+        return reconcileExited(c)     // already dead; just fix up state
+    }
+
+    // 1. Polite: ask to stop
+    if err := unix.Kill(c.PID, unix.SIGTERM); err != nil {
+        if !errors.Is(err, unix.ESRCH) { return err }   // ESRCH = already gone, not an error
+    }
+
+    // 2. Wait up to `timeout` for it to exit gracefully
+    if waitForExit(c, timeout) {
+        return reconcileExited(c)
+    }
+
+    // 3. Impolite: force it
+    if err := unix.Kill(c.PID, unix.SIGKILL); err != nil {
+        if !errors.Is(err, unix.ESRCH) { return err }
+    }
+
+    // 4. Short final wait, then reconcile regardless
+    waitForExit(c, time.Second)
+    return reconcileExited(c)
+}
+```
+
+This is the exact algorithm `docker stop` uses, and the algorithm `kubectl delete` uses (as "graceful termination"). Every container runtime ships some form of it.
+
+**Why `ESRCH` is ignored:** between `IsRunning` returning true and `Kill` running, the process could have exited on its own. `kill()` returns `ESRCH` ("no such process") — that's a *success* from our perspective (the container is dead, which is what we wanted). Conflating it with a real error would make stop randomly fail when the container was already stopping.
+
+**The polling inside `waitForExit`:**
+
+```go
+ticker := time.NewTicker(100 * time.Millisecond)
+for {
+    select {
+    case <-ctx.Done():         return false
+    case <-ticker.C:
+        if !state.IsRunning(c.PID, c.StartTime) { return true }
+    }
+}
+```
+
+100ms is a sweet spot: fast enough to feel instant to humans, slow enough that we're not burning CPU in a `/proc` read loop. A fancier implementation would use `pidfd_open` + `poll` to get an event-driven wake (Linux 5.3+), but polling is 5 lines and "good enough" is a feature.
+
+**Why `(PID, StartTime)` matters in `stop` specifically:** imagine the container exited 10 seconds ago, the kernel reused its PID for another process, and now you type `mydocker stop abc123`. Without the StartTime check, `waitForExit` would see *some* process with that PID and `IsRunning` would say yes forever. The StartTime check causes it to say "no, that's not our process" immediately. Same mechanism defends the SIGTERM itself from hitting a stranger.
+
+---
+
+### 6h · `rm` — cleanup with error aggregation
+
+```go
+// internal/container/rm.go
+func Rm(prefix string, force bool) error {
+    c, _ := state.Find(prefix)
+
+    if state.IsRunning(c.PID, c.StartTime) {
+        if !force {
+            return errors.New("container is running; stop first or use -f")
+        }
+        Stop(prefix, DefaultStopTimeout)
+    }
+
+    var errs []error
+    if err := overlay.Unmount(c.ID); err != nil {
+        errs = append(errs, fmt.Errorf("unmount overlay: %w", err))
+    }
+    if err := cgroup.New(c.ID).Destroy(); err != nil {
+        errs = append(errs, fmt.Errorf("destroy cgroup: %w", err))
+    }
+    if err := state.RemoveDir(c.ID); err != nil {
+        errs = append(errs, fmt.Errorf("remove state: %w", err))
+    }
+    if len(errs) > 0 { return errors.Join(errs...) }
+    return nil
+}
+```
+
+Two patterns worth internalizing:
+
+1. **Keep going on cleanup failures.** The first `if err != nil { return err }` instinct is wrong here. If the unmount fails, we *still* want to try destroying the cgroup and removing state — otherwise a partial failure leaves more garbage than necessary. Collect all errors, surface them together via `errors.Join`.
+2. **Refuse ambiguous intent, opt-in for destructive.** Running container + no `-f` → refuse. This matches Docker exactly. The "force" flag isn't just convenience — it's a signal that the user understood and accepted the consequence.
+
+`★ Insight ─────────────────────────────────────`
+`errors.Join` (Go 1.20+) is the right tool for "try N things, report all failures". Before it, people either returned only the first error (masking others) or built ad-hoc multi-error types (boilerplate). The standard library solution is ~3 lines and integrates with `errors.Is`/`errors.As`. One of those small 1.20 additions that quietly changed how I write cleanup code.
+`─────────────────────────────────────────────────`
+
+---
+
+### 6i · State lives on tmpfs — the limitation worth naming
+
+Look carefully at `overlay.go`:
+
+```go
+if !mounted {
+    unix.Mount("tmpfs", containersDir, "tmpfs", 0, "")
+}
+```
+
+`/var/lib/mydocker/containers/` — which now holds `state.json`, `stdout.log`, `stderr.log`, *and* the overlay upper/work/merged dirs — is **tmpfs-backed**. That means **all container state evaporates on reboot.**
+
+Is this a bug? Not quite — it's a deliberate scope simplification, with a defensible rationale:
+
+- On reboot, the container's *processes* are gone anyway (tmpfs or not).
+- The overlay upper/work/merged dirs on tmpfs die with the reboot too, so there's nothing to clean up on the next boot — no "orphaned container" problem.
+- Real Docker persists state *and* reconciles stale containers on daemon start. We have no daemon, so "clean slate on reboot" is consistent with our architecture.
+
+The trade-off: `mydocker ps -a` after a reboot will show nothing, even for containers that exited cleanly before. Real Docker would still list them. Worth fixing when we build the daemon (M9).
+
+---
+
+### M6 summary — what each command answers
+
+| Command | Question it answers | Key mechanism |
+|---|---|---|
+| `run <img>` | Start a container from a local image | `image.Resolve` + auto-pull on `ErrImageNotFound` |
+| `run -d` | Start detached (background) | `Setsid` + log redirect + skip `Wait`/`Unmount` |
+| `ps` / `ps -a` | What's running / what ever ran? | `state.List` + lazy reconciliation |
+| `logs <id>` | What did it print? | Read `stdout.log` (detached only) |
+| `stop <id>` | Ask nicely, then force | SIGTERM → poll → SIGKILL, with `ESRCH` tolerance |
+| `rm <id>` | Forget this container | `errors.Join` over unmount + cgroup + state cleanup |
+
+The three cross-cutting ideas tying them together:
+
+1. **`(PID, StartTime)` is the process identity** — PIDs alone aren't safe.
+2. **Lazy reconciliation** at every read keeps state honest without a reaper daemon.
+3. **Atomic writes + split cleanup responsibility** — state surviving past container exit is what enables `ps -a` and `logs`.
+
+---
+
+## Putting it all together — commands across milestones
 
 ### `mydocker pull alpine:3.19`
 
@@ -615,50 +1080,86 @@ Two general-form lessons emerge:
 [pull] SaveImage          → images/library_alpine_3.19/{manifest,config}.json
 ```
 
-### `mydocker run <layer> /bin/sh`
+### `mydocker run alpine:3.19 /bin/sh` (foreground)
 
 ```
-mydocker run --memory 64 --cpu 50 <layer-digest> /bin/sh
+mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
     │
     ▼
 [parent] overlay.EnsureRoot()                        ← tmpfs on /var/lib/mydocker/containers/ only
+[parent] store.Resolve("alpine:3.19")                ← image dir → manifest → reversed layer digests
+           │ (ErrImageNotFound? → store.Pull then Resolve again)
+           ▼
+[parent] overlay.Mount(id, layers)                   ← stacked rootfs → mergedPath
 [parent] cgroup.Create(limits)                       ← mkdir + write memory.max, cpu.max
 [parent] exec.Command("/proc/self/exe", "init", ...) ← with CLONE_NEWPID|NEWNS|NEWUTS|NEWIPC
-[parent] cg.AddPID(child.Pid)                        ← cage the child
+[parent] cg.AddPID(child.Pid)
+[parent] state.ReadStartTime(child.Pid)              ← record the (PID, StartTime) identity
+[parent] Container.Save()                            ← state.json, atomic write
+[parent] signal.Notify(SIGINT/SIGTERM) → forward     ← let the user's Ctrl-C reach the child
 [parent] Wait()
              │
              ▼
-        [child] sethostname("my-docker")
-        [child] setupRoot(rootfs)                    ← bind + pivot_root + detach old
-        [child] setupMounts()                        ← /proc /dev /sys + mknod
-        [child] execve("/bin/sh")                    ← child IS now /bin/sh
+        [child=PID 1 in ns] sethostname, setupRoot, setupMounts
+        [child] exec.Command(user's binary).Start()  ← init stays alive as PID 1
+        [child] signal.Notify(SIGTERM/INT/QUIT/HUP/USR1/USR2) → forward to user proc
+        [child] Wait() on user proc → os.Exit(code)
              │
-             ▼  (user types `exit`)
-        (child dies → parent unblocks → defers run)
-[parent] overlay.Unmount(id)                         ← tear down merged + cleanup dir
-[parent] cg.Destroy()                                ← rmdir the cgroup
+             ▼  (user exits / stop / crash)
+[parent] state.Status = "exited", ExitCode, FinishedAt
+[parent] Container.Save()                            ← final state persisted
+[parent] overlay.Unmount(id)                         ← tear down merged (state dir stays!)
+[parent] cg.Destroy()
+```
+
+### `mydocker run -d alpine:3.19 /bin/sleep 3600` (detached)
+
+```
+(same setup through cgroup.AddPID + state.Save)
+    │
+    ▼
+[parent] stdout/stderr → /var/lib/mydocker/containers/<id>/std{out,err}.log
+[parent] cmd.SysProcAttr.Setsid = true               ← new session, survives shell SIGHUP
+[parent] cmd.Start() → RETURN IMMEDIATELY           ← no Wait, no cgroup.Destroy, no Unmount
+[parent] print container ID                          ← like `docker run -d`
+
+(container lives on; `mydocker ps` shows it, `logs <id>` reads the log file)
+
+... eventually ...
+
+[user] mydocker stop <id>
+   → state.Find → IsRunning? → SIGTERM → waitForExit(10s) → SIGKILL → reconcileExited
+
+[user] mydocker rm <id>
+   → overlay.Unmount + cgroup.Destroy + state.RemoveDir (errors.Join all three)
 ```
 
 ---
 
-## What's next (milestones 6–10)
+## What's next (milestones 7–10)
 
 | # | What | Why it's the logical next step |
 |---|------|-------------------------------|
-| 5.5 | **Teach `run` to take image refs** | Currently `run` takes a layer *digest* as a positional. Next: resolve `alpine:3.19` → read `images/library_alpine_3.19/manifest.json` → pass the full layer list into `overlay.Mount`. |
-| 6 | **Container lifecycle** (`ps`, `stop`, `rm`) | Requires persisting container metadata — a small state store on disk. We already have an on-disk layout convention to imitate. |
-| 7 | **Networking** (veth, bridge, NAT) | The big one. `CLONE_NEWNET` + creating a veth pair + a bridge + iptables NAT. |
+| 7 | **Networking** (veth, bridge, NAT) | The big one. `CLONE_NEWNET` + creating a veth pair + a bridge + iptables NAT so containers can reach the internet. |
 | 8 | Volumes | Bind mounts from host into container — trivial *mechanically*, fiddly in UX. |
-| 9 | Daemon architecture | Split `mydocker` into CLI + daemon with a Unix socket API — mirrors dockerd/docker. |
-| 10 | CLI polish | Cobra, better errors, etc. |
+| 9 | Daemon architecture | Split `mydocker` into CLI + daemon with a Unix socket API — this also solves M6's state-on-reboot problem and the PID 1 zombie-reaping gap. |
+| 10 | CLI polish | Cobra, better errors, maybe `logs -f` / `exec` / `inspect`. |
 
 ---
 
 ## Open questions to sit with
 
+### From M1–M5
 - If we forgot the `MS_PRIVATE|MS_REC` line in `setupRoot`, what exactly would break on the host, and when would we notice?
 - The gap between `cmd.Start()` and `cg.AddPID()` is a real race. How does `clone3(CLONE_INTO_CGROUP)` close it, and why can't we easily use it from Go's `os/exec`?
-- Why does overlayfs want the lowerdir list in *top-most-first* order? (Hint: think about how lookups resolve when the same path exists in two layers.)
+- Why does overlayfs want the lowerdir list in *top-most-first* order? (We answered this in `image.Resolve`: lookups resolve top-down and manifests list bottom-up, so we reverse. Make sure you can explain it in your own words.)
 - Our `Client` caches a single bearer token. What changes if a user does `mydocker pull alpine && mydocker pull nginx` in one process? (Hint: read the `scope` field of the WWW-Authenticate challenge carefully.)
-- `ExtractLayer` skips `.wh.*` whiteout files, but a real extraction-and-stack flow would need to *apply* them — translating "delete this path" markers into overlayfs's own whiteout convention. Where in the pipeline would that translation belong?
-- `pull.go` currently throws away the layer ordering when it calls `ExtractLayer` (each layer goes into its own dir). When we wire `run` to take image refs, which *order* must we pass to `overlay.Mount([]string)`, and how does that relate to the order in `manifest.Layers`?
+- `ExtractLayer` skips `.wh.*` whiteout files. When would stacking two pulled layers require *applying* these instead of skipping?
+
+### New to M6
+- What goes wrong if we kill the parent `mydocker run` process with `SIGKILL` while the container is alive in foreground mode? Which pieces of state end up inconsistent, and which of our other commands self-heal it?
+- Our `init` inside the container only `Wait`s for its direct child. Imagine the user runs `bash -c 'sleep 1000 & exec /bin/foo'`. When `foo` exits, what happens to the `sleep` process, and what's the observable consequence from outside? (Hint: zombies, PID leaks.)
+- `stop` polls `IsRunning` every 100ms. What's the alternative using `pidfd_open(2)` + `poll(2)`, and why is it strictly better? Why didn't we reach for it?
+- Why did we keep `/var/lib/mydocker/containers/` on tmpfs even though it now holds `state.json` (persistent-looking data)? What specifically would break if we moved it to disk without *also* adding a reconciliation pass on startup?
+- `ps` reconciles stale "running" status at read time. What fails if two `mydocker` processes run `ps` simultaneously and both try to `Save()` the same container's state? Is this actually a problem in our use case?
+- `rm` doesn't verify that overlay unmount succeeded before removing the state directory. What's the worst case if the unmount fails silently? (Hint: mount point vs state dir are sibling paths.)

@@ -85,3 +85,7 @@ func StdoutPath(id string) string {
 func StderrPath(id string) string {
 	return filepath.Join(containersDir, id, "stderr.log")
 }
+
+func RemoveDir(id string) error {
+	return os.RemoveAll(containerStateDir(id))
+}

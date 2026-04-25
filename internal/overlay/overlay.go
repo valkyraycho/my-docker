@@ -121,9 +121,5 @@ func Unmount(containerID string) error {
 	if err := unix.Unmount(mergedPath, unix.MNT_DETACH); err != nil {
 		return fmt.Errorf("unmount overlay: %w", err)
 	}
-
-	if err := os.RemoveAll(containerDir); err != nil {
-		return fmt.Errorf("remove container dir: %w", err)
-	}
 	return nil
 }
