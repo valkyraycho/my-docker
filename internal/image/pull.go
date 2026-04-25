@@ -73,7 +73,7 @@ func (s *Store) Pull(client *registry.Client, ref string) error {
 	}
 
 	for _, layer := range manifest.Layers {
-		fmt.Printf("fetching %s\n", layer.Digest)
+		fmt.Fprintf(os.Stderr, "fetching %s\n", layer.Digest)
 		if err := s.FetchBlob(client, repo, layer.Digest); err != nil {
 			return fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
 		}

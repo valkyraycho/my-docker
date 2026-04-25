@@ -32,6 +32,8 @@ func main() {
 		pullCommand(os.Args[2:])
 	case "ps":
 		psCommand(os.Args[2:])
+	case "logs":
+		logsCommand(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -158,7 +160,7 @@ func pullCommand(args []string) {
 		fmt.Fprintf(os.Stderr, "pull: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("pulled %s\n", ref)
+	fmt.Fprintf(os.Stderr, "pulled %s\n", ref)
 }
 
 func psCommand(args []string) {
@@ -170,6 +172,17 @@ func psCommand(args []string) {
 	}
 
 	if err := container.Ps(os.Stdout, *showAll); err != nil {
+		os.Exit(1)
+	}
+}
+
+func logsCommand(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: mydocker logs <id>\n")
+		os.Exit(1)
+	}
+	if err := container.Logs(os.Stdout, args[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "logs: %v\n", err)
 		os.Exit(1)
 	}
 }
