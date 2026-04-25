@@ -10,6 +10,8 @@ import (
 	"github.com/valkyraycho/my-docker/internal/registry"
 )
 
+var ErrImageNotFound = errors.New("image not found")
+
 func (s *Store) Resolve(ref string) ([]string, error) {
 	repo, tag := parseRef(ref)
 
@@ -17,7 +19,7 @@ func (s *Store) Resolve(ref string) ([]string, error) {
 	manifestBytes, err := os.ReadFile(filepath.Join(imageDir, "manifest.json"))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("image %q not found — run `mydocker pull %s` first", ref, ref)
+			return nil, fmt.Errorf("image %q not found: %w", ref, ErrImageNotFound)
 		}
 		return nil, fmt.Errorf("read manifest for %s: %w", ref, err)
 	}

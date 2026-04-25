@@ -5,6 +5,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -29,6 +30,8 @@ func main() {
 		initCommand(os.Args[2:])
 	case "pull":
 		pullCommand(os.Args[2:])
+	case "ps":
+		psCommand(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -62,7 +65,20 @@ func runCommand(args []string) {
 	cmdArgs := posArgs[1:]
 
 	store := image.New()
+
 	layers, err := store.Resolve(ref)
+	if err != nil {
+		if errors.Is(err, image.ErrImageNotFound) {
+			fmt.Fprintf(os.Stderr, "image %q not found locally, pulling...\n", ref)
+			client := registry.New(image.DefaultRegistry)
+			if err := store.Pull(client, ref); err != nil {
+				fmt.Fprintf(os.Stderr, "pull: %v\n", err)
+				os.Exit(1)
+			}
+			layers, err = store.Resolve(ref)
+		}
+	}
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "resolve: %v\n", err)
 		os.Exit(1)
@@ -143,4 +159,17 @@ func pullCommand(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("pulled %s\n", ref)
+}
+
+func psCommand(args []string) {
+	fs := flag.NewFlagSet("ps", flag.ExitOnError)
+	showAll := fs.Bool("a", false, "show all containers (default: running only)")
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	if err := container.Ps(os.Stdout, *showAll); err != nil {
+		os.Exit(1)
+	}
 }
