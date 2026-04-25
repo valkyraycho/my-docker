@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 
 	"github.com/valkyraycho/my-docker/internal/cgroup"
 	"github.com/valkyraycho/my-docker/internal/container"
@@ -34,6 +35,8 @@ func main() {
 		psCommand(os.Args[2:])
 	case "logs":
 		logsCommand(os.Args[2:])
+	case "stop":
+		stopCommand(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		os.Exit(1)
@@ -116,6 +119,10 @@ func runCommand(args []string) {
 	}
 
 	if err := container.Run(opts); err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			os.Exit(ee.ExitCode())
+		}
 		fmt.Fprintf(os.Stderr, "run: %v\n", err)
 		os.Exit(1)
 	}
@@ -185,4 +192,25 @@ func logsCommand(args []string) {
 		fmt.Fprintf(os.Stderr, "logs: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func stopCommand(args []string) {
+	fs := flag.NewFlagSet("stop", flag.ExitOnError)
+	timeout := fs.Duration("t", container.DefaultStopTimeout, "timeout before sending SIGKILL")
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	posArgs := fs.Args()
+	if len(posArgs) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: mydocker stop [-t <timeout>] <id>\n")
+		os.Exit(1)
+	}
+	if err := container.Stop(posArgs[0], *timeout); err != nil {
+		fmt.Fprintf(os.Stderr, "stop: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(posArgs[0])
 }
