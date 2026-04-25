@@ -829,33 +829,63 @@ Before M6:
 return unix.Exec(binary, args, os.Environ())
 ```
 
-After M6:
+After M6 (with orphan reaping, added as M6.5 polish):
 
 ```go
-// new: init STAYS ALIVE as PID 1 and spawns the user command as a child
-cmd := exec.Command(binary, args[1:]...)
+// new: init STAYS ALIVE as PID 1 and owns BOTH PID-1 responsibilities:
+// (a) signal forwarding, (b) reaping any zombie that re-parents to us.
+
+childCh := make(chan os.Signal, 1)
+signal.Notify(childCh, syscall.SIGCHLD)   // armed BEFORE Start to avoid a race
 cmd.Start()
+directChild := cmd.Process.Pid
 
-sigCh := make(chan os.Signal, 1)
-signal.Notify(sigCh, SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGUSR1, SIGUSR2)
-go func() {
-    for sig := range sigCh { _ = cmd.Process.Signal(sig) }
-}()
+fwdCh := make(chan os.Signal, 1)
+signal.Notify(fwdCh, SIGTERM, SIGINT, SIGQUIT, SIGHUP, SIGUSR1, SIGUSR2)
+go func() { for sig := range fwdCh { _ = cmd.Process.Signal(sig) } }()
 
-err = cmd.Wait()
-os.Exit(cmd.ProcessState.ExitCode())
+os.Exit(reapUntilDirectExits(directChild, childCh))
 ```
 
-**Why the change?** In a container with `CLONE_NEWPID`, the first process *is* PID 1 — the kernel's init process from that namespace's perspective. PID 1 has special responsibilities:
+with the reaper itself:
+
+```go
+func reapUntilDirectExits(directChild int, childCh <-chan os.Signal) int {
+    for range childCh {
+        // SIGCHLD coalesces — drain with WNOHANG on every wakeup.
+        for {
+            var ws syscall.WaitStatus
+            pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+            if err != nil || pid <= 0 { break }
+            if pid != directChild { continue }     // silently reap orphans
+
+            switch {
+            case ws.Exited():   return ws.ExitStatus()
+            case ws.Signaled(): return 128 + int(ws.Signal())   // shell convention
+            default:            return 1
+            }
+        }
+    }
+    return 1
+}
+```
+
+**Why the change?** In a container with `CLONE_NEWPID`, the first process *is* PID 1 — the kernel's init process from that namespace's perspective. PID 1 has two special responsibilities:
 
 1. **Signal default handlers don't apply.** The kernel refuses to deliver signals whose only handler is the default to PID 1. If init doesn't explicitly register a handler for `SIGTERM`, `kill 1` does *nothing*. That's why `docker stop` on a naive image often seems to hang for 10 seconds then SIGKILL.
-2. **Orphan reaping.** When a process's parent dies, its children re-parent to PID 1, which must `wait()` for them when they exit. Without reaping, zombies accumulate until you run out of PIDs.
+2. **Orphan reaping.** When a process's parent dies, its children re-parent to PID 1, which must `wait()` for them when they exit. Without reaping, zombies accumulate until you run out of PIDs (or hit `pids.max`).
 
-Our new `Init` handles #1 (signal forwarding for a long list of signals) but only partially handles #2 — `cmd.Wait()` reaps the *direct* child only. If the user's workload forks grandchildren that later get orphaned, they re-parent to our init and become zombies that nothing reaps. A fully-correct init would loop `syscall.Wait4(-1, ..., WNOHANG, nil)` on every `SIGCHLD`. This is exactly what `tini` and `dumb-init` exist to do.
+`★ Insight ─────────────────────────────────────`
+**Why we abandoned `cmd.Wait()`:** Go's `cmd.Wait()` calls `Wait4(specificPID, ...)` — it only reaps the direct child. If we *also* run a `Wait4(-1, ...)` reaper, there's a race: our reaper might grab the direct child first, and then `cmd.Wait()` returns `ECHILD` because the child is already reaped. The clean fix is to do *all* reaping ourselves via `Wait4(-1, WNOHANG)` and ignore `cmd.Wait()` entirely. We track the direct child's PID manually and return its exit code when we see it come through the reaper loop.
 
-**Why that's OK for M6:** our containers are mostly `sh` or short-lived commands. The common case is no grandchildren, and if there are, they die when `sh` does. The limitation is real but minor — noted as an open question.
+**The `128 + signal` convention:** when a process is killed by signal N (not normal `exit()`), the convention is to report exit code `128 + N`. So `SIGKILL=9` → exit 137, `SIGTERM=15` → exit 143. Matches bash, matches Docker, matches every other runtime. It's the reason you've seen "exit 137" before and wondered what 137 meant.
 
-> **Junior-dev gotcha to internalize:** "PID 1 is special" is not a rule you'll find from reading userspace code — it's kernel behavior. When you inherit a container that "mysteriously doesn't respond to SIGTERM," the answer is almost always: no signal handler on PID 1.
+**`SIGCHLD` can coalesce.** If three children die in the same scheduler tick, we get *one* `SIGCHLD`, not three. That's why the inner loop drains with `WNOHANG` until `Wait4` reports "nothing more right now" — otherwise we'd leak zombies whenever siblings died close together.
+`─────────────────────────────────────────────────`
+
+**Why registering `SIGCHLD` notification *before* `cmd.Start()` matters:** in theory, the child could exit between `Start()` returning and `signal.Notify()` installing. If that happens, the SIGCHLD hits Go's default (ignored) before we're watching, and our reaper never wakes up — the child's zombie sits there forever. Arming the handler first closes that window.
+
+> **Junior-dev gotcha to internalize:** "PID 1 is special" is not a rule you'll find from reading userspace code — it's kernel behavior. When you inherit a container that "mysteriously doesn't respond to SIGTERM," or accumulates zombies without anyone's code being obviously buggy, the answer is almost always: PID 1 didn't take on its two responsibilities. `tini` is a 500-line C program that exists precisely because Docker images run `node` or `python` as PID 1 without knowing this.
 
 ---
 
@@ -1142,7 +1172,7 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
 |---|------|-------------------------------|
 | 7 | **Networking** (veth, bridge, NAT) | The big one. `CLONE_NEWNET` + creating a veth pair + a bridge + iptables NAT so containers can reach the internet. |
 | 8 | Volumes | Bind mounts from host into container — trivial *mechanically*, fiddly in UX. |
-| 9 | Daemon architecture | Split `mydocker` into CLI + daemon with a Unix socket API — this also solves M6's state-on-reboot problem and the PID 1 zombie-reaping gap. |
+| 9 | Daemon architecture | Split `mydocker` into CLI + daemon with a Unix socket API — this also solves M6's state-on-reboot problem. |
 | 10 | CLI polish | Cobra, better errors, maybe `logs -f` / `exec` / `inspect`. |
 
 ---
@@ -1158,7 +1188,7 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
 
 ### New to M6
 - What goes wrong if we kill the parent `mydocker run` process with `SIGKILL` while the container is alive in foreground mode? Which pieces of state end up inconsistent, and which of our other commands self-heal it?
-- Our `init` inside the container only `Wait`s for its direct child. Imagine the user runs `bash -c 'sleep 1000 & exec /bin/foo'`. When `foo` exits, what happens to the `sleep` process, and what's the observable consequence from outside? (Hint: zombies, PID leaks.)
+- Our init now reaps orphans via `Wait4(-1, WNOHANG)` on every `SIGCHLD`. Trace through what happens if the *direct child* (workload) dies first, while an orphan is still running: who kills the orphan, and what's the exit code `mydocker` reports? Now reverse it — orphan dies first, then workload. Same answer or different? (Hint: the PID-namespace teardown rule we met in section 6d.)
 - `stop` polls `IsRunning` every 100ms. What's the alternative using `pidfd_open(2)` + `poll(2)`, and why is it strictly better? Why didn't we reach for it?
 - Why did we keep `/var/lib/mydocker/containers/` on tmpfs even though it now holds `state.json` (persistent-looking data)? What specifically would break if we moved it to disk without *also* adding a reconciliation pass on startup?
 - `ps` reconciles stale "running" status at read time. What fails if two `mydocker` processes run `ps` simultaneously and both try to `Save()` the same container's state? Is this actually a problem in our use case?
