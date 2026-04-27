@@ -4,6 +4,7 @@ package container
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -12,6 +13,10 @@ import (
 )
 
 func Init(rootfs string, args []string) error {
+	if err := waitForParent(); err != nil {
+		return fmt.Errorf("wait for parent: %w", err)
+	}
+
 	if err := unix.Sethostname([]byte("my-docker")); err != nil {
 		return fmt.Errorf("sethostname: %w", err)
 	}
@@ -88,4 +93,19 @@ func reapUntilDirectExits(directChild int, childCh <-chan os.Signal) int {
 		}
 	}
 	return 1
+}
+
+func waitForParent() error {
+	syncFile := os.NewFile(3, "sync")
+	if syncFile == nil {
+		return fmt.Errorf("sync pipe (fd 3) not present")
+	}
+
+	defer syncFile.Close()
+
+	if _, err := io.Copy(io.Discard, syncFile); err != nil {
+		return fmt.Errorf("read sync: %w", err)
+	}
+
+	return nil
 }

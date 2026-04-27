@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/valkyraycho/my-docker/internal/cgroup"
+	"github.com/valkyraycho/my-docker/internal/network"
 	"github.com/valkyraycho/my-docker/internal/overlay"
 	"github.com/valkyraycho/my-docker/internal/state"
 )
@@ -39,6 +40,11 @@ func Rm(prefix string, force bool) error {
 	if err := state.RemoveDir(c.ID); err != nil {
 		errs = append(errs, fmt.Errorf("remove container state directory: %w", err))
 	}
+
+	if err := network.Teardown(c.ID); err != nil {
+		errs = append(errs, fmt.Errorf("teardown network: %w", err))
+	}
+
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}

@@ -7,11 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/valkyraycho/my-docker/internal/cgroup"
+	"github.com/valkyraycho/my-docker/internal/network"
 	"github.com/valkyraycho/my-docker/internal/state"
+	"golang.org/x/sys/unix"
 )
 
 type RunOptions struct {
@@ -26,8 +27,8 @@ type RunOptions struct {
 
 func Run(opts RunOptions) error {
 	cmd := exec.Command("/proc/self/exe", append([]string{"init", opts.Rootfs}, opts.Args...)...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWUTS | syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC,
+	cmd.SysProcAttr = &unix.SysProcAttr{
+		Cloneflags: unix.CLONE_NEWPID | unix.CLONE_NEWUTS | unix.CLONE_NEWNS | unix.CLONE_NEWIPC | unix.CLONE_NEWNET,
 	}
 
 	if opts.Detach {
@@ -55,10 +56,21 @@ func Run(opts RunOptions) error {
 		return fmt.Errorf("create cgroup: %w", err)
 	}
 
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("create sync pipe: %w", err)
+	}
+
+	cmd.ExtraFiles = []*os.File{pipeR}
+
+	defer pipeW.Close()
+
 	if err := cmd.Start(); err != nil {
+		pipeR.Close()
 		cg.Destroy()
 		return fmt.Errorf("start: %w", err)
 	}
+	pipeR.Close()
 
 	if err := cg.AddPID(cmd.Process.Pid); err != nil {
 		cmd.Process.Kill()
@@ -73,6 +85,13 @@ func Run(opts RunOptions) error {
 		return fmt.Errorf("read start time: %w", err)
 	}
 
+	ip, err := network.Setup(opts.ContainerID, opts.Rootfs, cmd.Process.Pid)
+	if err != nil {
+		cmd.Process.Kill()
+		cg.Destroy()
+		return fmt.Errorf("network setup: %w", err)
+	}
+
 	now := time.Now()
 
 	c := &state.Container{
@@ -85,20 +104,30 @@ func Run(opts RunOptions) error {
 		Status:    state.StatusRunning,
 		CreatedAt: now,
 		StartedAt: now,
+		IP:        ip,
 	}
 	if err := c.Save(); err != nil {
 		cmd.Process.Kill()
 		cg.Destroy()
+		network.Teardown(opts.ContainerID)
 		return fmt.Errorf("save state: %w", err)
+	}
+
+	if err := pipeW.Close(); err != nil {
+		cmd.Process.Kill()
+		cg.Destroy()
+		network.Teardown(opts.ContainerID)
+		return fmt.Errorf("signal child: %w", err)
 	}
 
 	if opts.Detach {
 		return nil
 	}
 	defer cg.Destroy()
+	defer network.Teardown(opts.ContainerID)
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, unix.SIGINT, unix.SIGTERM)
 	go func() {
 		for sig := range sigCh {
 			cmd.Process.Signal(sig)
