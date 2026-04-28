@@ -12,6 +12,7 @@ import (
 	"github.com/valkyraycho/my-docker/internal/cgroup"
 	"github.com/valkyraycho/my-docker/internal/network"
 	"github.com/valkyraycho/my-docker/internal/state"
+	"github.com/valkyraycho/my-docker/internal/volume"
 	"golang.org/x/sys/unix"
 )
 
@@ -23,6 +24,7 @@ type RunOptions struct {
 	Limits      cgroup.Limits
 	Args        []string
 	Detach      bool
+	Volumes     []*volume.Spec
 }
 
 func Run(opts RunOptions) error {
@@ -54,6 +56,18 @@ func Run(opts RunOptions) error {
 	cg := cgroup.New(opts.ContainerID)
 	if err := cg.Create(opts.Limits); err != nil {
 		return fmt.Errorf("create cgroup: %w", err)
+	}
+
+	var mountedSoFar []*volume.Spec
+	for _, spec := range opts.Volumes {
+		if err := volume.Mount(spec, opts.Rootfs); err != nil {
+			for _, prev := range mountedSoFar {
+				_ = volume.Unmount(prev, opts.Rootfs)
+			}
+			cg.Destroy()
+			return fmt.Errorf("mount volume %s:%s: %w", spec.Source, spec.Target, err)
+		}
+		mountedSoFar = append(mountedSoFar, spec)
 	}
 
 	pipeR, pipeW, err := os.Pipe()
@@ -105,6 +119,7 @@ func Run(opts RunOptions) error {
 		CreatedAt: now,
 		StartedAt: now,
 		IP:        ip,
+		Volumes:   opts.Volumes,
 	}
 	if err := c.Save(); err != nil {
 		cmd.Process.Kill()

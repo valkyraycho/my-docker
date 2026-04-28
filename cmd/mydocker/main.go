@@ -16,6 +16,7 @@ import (
 	"github.com/valkyraycho/my-docker/internal/image"
 	"github.com/valkyraycho/my-docker/internal/overlay"
 	"github.com/valkyraycho/my-docker/internal/registry"
+	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
 func main() {
@@ -51,6 +52,10 @@ func runCommand(args []string) {
 	cpuPct := fs.Int("cpu", 0, "cpu limit as percent (0 = no limit)")
 	pidsMax := fs.Int("pids", 0, "max processes (0 = no limit)")
 	detach := fs.Bool("d", false, "run container in background")
+
+	var volumeSpecs stringSliceFlag
+	fs.Var(&volumeSpecs, "v", "volume mount (repeatable): src:dst[:ro]")
+
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
@@ -110,6 +115,16 @@ func runCommand(args []string) {
 		PidsMax:     *pidsMax,
 	}
 
+	var specs []*volume.Spec
+	for _, s := range volumeSpecs {
+		spec, err := volume.Parse(s)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "volume: %v\n", err)
+			os.Exit(1)
+		}
+		specs = append(specs, spec)
+	}
+
 	opts := container.RunOptions{
 		ContainerID: containerID,
 		Image:       ref,
@@ -118,6 +133,7 @@ func runCommand(args []string) {
 		Limits:      limits,
 		Args:        cmdArgs,
 		Detach:      *detach,
+		Volumes:     specs,
 	}
 
 	if err := container.Run(opts); err != nil {

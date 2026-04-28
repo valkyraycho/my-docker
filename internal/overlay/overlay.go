@@ -123,3 +123,7 @@ func Unmount(containerID string) error {
 	}
 	return nil
 }
+
+func MergedPath(containerID string) string {
+	return filepath.Join(containersDir, containerID, "merged")
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/valkyraycho/my-docker/internal/network"
 	"github.com/valkyraycho/my-docker/internal/overlay"
 	"github.com/valkyraycho/my-docker/internal/state"
+	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
 func Rm(prefix string, force bool) error {
@@ -27,6 +28,12 @@ func Rm(prefix string, force bool) error {
 		}
 	}
 	var errs []error
+
+	for _, spec := range c.Volumes {
+		if err := volume.Unmount(spec, overlay.MergedPath(c.ID)); err != nil {
+			errs = append(errs, fmt.Errorf("unmount volume %s: %w", spec.Target, err))
+		}
+	}
 
 	if err := overlay.Unmount(c.ID); err != nil {
 		errs = append(errs, fmt.Errorf("unmount overlay: %w", err))

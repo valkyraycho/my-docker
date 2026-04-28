@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
 const (
@@ -34,7 +36,10 @@ type Container struct {
 	CreatedAt  time.Time `json:"created_at"`
 	StartedAt  time.Time `json:"started_at,omitempty"`
 	FinishedAt time.Time `json:"finished_at,omitempty"`
-	IP         string    `json:"ip,omitempty"`
+
+	IP string `json:"ip,omitempty"`
+
+	Volumes []*volume.Spec `json:"volumes,omitempty"`
 }
 
 func (c *Container) Save() error {
