@@ -1094,6 +1094,463 @@ The three cross-cutting ideas tying them together:
 
 ---
 
+## Milestone 7 — Networking (bridge, veth, NAT, DNS)
+
+**The core change:** we added `CLONE_NEWNET` to the clone flags. That one flag creates a brand-new network namespace for the container — and that namespace is *completely empty*. No `eth0`, no `lo`, no routes, no DNS. A process in there can't even ping `127.0.0.1` until we give it a loopback.
+
+So the milestone is a single question in four parts:
+
+> Given an empty netns, how do we give the container (a) an IP, (b) a route to the outside world, (c) source-IP masquerading so return traffic finds it, and (d) DNS to resolve names?
+
+The answer is a four-layer stack, which is exactly what real Docker does:
+
+```
+                   The Internet
+                        ▲
+                        │  (source IP masqueraded by iptables NAT)
+                        │
+   host's eth0 ─────────┘
+                        │
+   ┌────────────────────┴─────────────────────┐
+   │                HOST NETNS                 │
+   │                                           │
+   │  mydocker0 (bridge, 172.42.0.1/24) ◄──┐   │
+   │                                       │   │
+   │    v<id1>  v<id2>  v<id3>  ← attached to bridge (host side of veth)
+   │      │      │      │                      │
+   │ ═════╪══════╪══════╪════════ namespace boundary ═════
+   │      │      │      │                      │
+   │    eth0   eth0   eth0  ← renamed from peer side (inside container netns)
+   │    .2      .3     .4                      │
+   │                                           │
+   │  container-1  container-2  container-3    │
+   │                                           │
+   └───────────────────────────────────────────┘
+```
+
+Every container gets its own netns, its own IP, its own `eth0`. They all plug into a shared L2 switch (the bridge) in the host netns, and traffic to the outside world gets source-NAT'd on the way out.
+
+---
+
+### 7a · The `ip` package — persistent IP allocation
+
+Before we can plumb, we need to decide *which* IP each container gets. Our subnet is `172.42.0.0/24` with gateway `172.42.0.1`. That leaves 253 usable IPs (.2 through .254).
+
+```go
+// internal/network/ip.go
+const (
+    subnet    = "172.42.0.0/24"
+    gatewayIP = "172.42.0.1"
+    allocFile = "/var/lib/mydocker/network/allocated_ips.json"
+)
+
+type allocation struct {
+    ContainerID string `json:"container_id"`
+    IP          string `json:"ip"`
+}
+```
+
+The allocator is dead simple: enumerate candidate IPs, skip the ones already taken, pick the first free one, persist.
+
+```go
+// AllocateIP (simplified)
+used := setOf(existingAllocations)
+for _, c := range ipRange(subnet) {
+    if _, taken := used[c]; !taken {
+        picked = c; break
+    }
+}
+allocations = append(allocations, allocation{id, picked})
+writeAllocations(allocations)  // temp + rename, like every other persistent write in this project
+```
+
+Three small design choices worth naming:
+
+1. **Skip the gateway IP in `ipRange`** — `.1` belongs to the bridge itself, not to containers. Forgetting this causes spectacularly confusing ARP collisions.
+2. **Skip `.0` and `.255`** — network address and broadcast. The loop `for i := 1; i < total-1; i++` enforces this.
+3. **Temp-write + rename** — same atomicity pattern as M5's blob writes. Prevents a corrupt JSON from killing the next allocation attempt.
+
+`★ Insight ─────────────────────────────────────`
+**Why persist allocations to disk at all?** Because we have no daemon. If IPs lived in a `map[string]string` in a running process, every `mydocker run` would start fresh with no knowledge of which IPs are already bound to living containers, and you'd double-assign. The file is how multiple `mydocker` invocations agree on shared state.
+
+**The limitation this creates:** the file persists across reboots, but the kernel's network state doesn't. After a reboot, `allocated_ips.json` still lists IPs as "taken" that no one actually holds. Over time, the file fills up with stale entries and we run out. A production fix would reconcile allocations against actually-running containers (or store per-container in `state.json` and let it die with the container's state dir). Noted as an open question.
+`─────────────────────────────────────────────────`
+
+---
+
+### 7b · The bridge (`mydocker0`) — a virtual L2 switch
+
+A **bridge** in Linux is a software implementation of an Ethernet switch: a device that lives in the host kernel, has a MAC address and optional IP, and forwards L2 frames between all devices attached to it. If you think of `eth0` as a cable port on a physical switch, `mydocker0` is the switch itself — except entirely in software.
+
+```go
+// internal/network/bridge.go — EnsureBridge (four steps)
+func EnsureBridge() error {
+    if !bridgeExists() {
+        createBridge()       // ip link add mydocker0 type bridge
+        assignGatewayIP()    // ip addr add 172.42.0.1/24 dev mydocker0
+    }
+    bringBridgeUp()          // ip link set mydocker0 up
+    enableIPForwarding()     // sysctl -w net.ipv4.ip_forward=1
+    return nil
+}
+```
+
+**Why each step:**
+
+- **`ip link add mydocker0 type bridge`** — creates the kernel object. After this, `ip link show` lists it, but it has no IP and is DOWN.
+- **`ip addr add 172.42.0.1/24 dev mydocker0`** — gives the bridge itself an IP in the container subnet. This IP is the **default gateway** for every container. When a container sends a packet to `1.1.1.1`, its route says "send via 172.42.0.1" — the bridge receives it at its host-side interface, and Linux's routing stack takes over from there.
+- **`ip link set mydocker0 up`** — activates the interface. A DOWN interface drops everything.
+- **`sysctl -w net.ipv4.ip_forward=1`** — flips on routing between interfaces. Without this, the kernel treats itself as an end-host (only processes packets *for* the host's IPs). With it on, the kernel will forward packets between `mydocker0` and the host's external interface (`eth0`, Wi-Fi, etc.). **This is the single setting that turns your laptop into a router for containers.**
+
+**Idempotency:** `bridgeExists` is just `ip link show mydocker0` — exit code 0 means it's there. Checking first avoids the `RTNETLINK answers: File exists` error when we re-run.
+
+---
+
+### 7c · veth pairs — the "Ethernet cable" between namespaces
+
+A **veth pair** is the single most important primitive in Linux container networking. Think of it as a virtual Ethernet cable: two interfaces that are connected to each other such that anything sent into one comes out the other. Crucially, the two ends can live in *different network namespaces*.
+
+```go
+// internal/network/veth.go — SetupVeth, the choreography
+func SetupVeth(containerID string, pid int, ip string) error {
+    host := "v" + containerID   // the end that stays in host netns
+    peer := "p" + containerID   // the end that moves into container netns
+
+    createVethPair(host, peer)              // ip link add v<id> type veth peer name p<id>
+    movePeerSideIntoNetns(peer, pid)        // ip link set p<id> netns <pid>
+    attachHostSideToBridge(host)            // ip link set v<id> master mydocker0
+    bringHostSideUp(host)                   // ip link set v<id> up
+    configureInsideNetns(pid, peer, ipCIDR) // everything inside the container's netns
+}
+```
+
+The six-step dance is worth internalizing because it mirrors how *every* container runtime sets up networking:
+
+```
+Step 1: create the pair        [host]      [host]
+                                v<id> ═══ p<id>
+
+Step 2: move peer into netns   [host]      [container netns]
+                                v<id> ═══ p<id>
+
+Step 3: plug v into bridge     [host: bridge]──v<id> ═══ p<id>  [container netns]
+
+Step 4: bring v up             [host: bridge]──v<id>═══ p<id>  [container netns]
+                                                 UP
+
+Step 5+: inside container netns, configure p (rename to eth0, set IP, default route)
+```
+
+The "configure inside netns" step is done via `nsenter`:
+
+```go
+// internal/network/veth.go — configureInsideNetns
+nsRun(pid, "ip", "link", "set", peerSide, "name", "eth0")    // rename p<id> → eth0 (convention)
+nsRun(pid, "ip", "link", "set", "lo",     "up")              // loopback — needed for 127.0.0.1!
+nsRun(pid, "ip", "addr", "add", ipCIDR,   "dev", "eth0")     // assign IP + prefix
+nsRun(pid, "ip", "link", "set", "eth0",   "up")              // activate
+nsRun(pid, "ip", "route", "add", "default", "via", gatewayIP) // default route → bridge IP
+```
+
+Where `nsRun` is:
+
+```go
+func nsRun(pid int, cmd string, args ...string) error {
+    all := append([]string{"-t", strconv.Itoa(pid), "-n", cmd}, args...)
+    return run("nsenter", all...)
+}
+```
+
+`nsenter -t <pid> -n <cmd>` means "enter the **n**etwork namespace of process `<pid>` and run `<cmd>` there." It works by opening `/proc/<pid>/ns/net` and calling `setns(2)` before executing the command. This is how we can configure the container's network *from outside* — we never enter the container's mount namespace, just its netns.
+
+`★ Insight ─────────────────────────────────────`
+**Why bring `lo` up explicitly?** Every other namespace Linux creates (PID, mount, IPC, UTS) comes with sane defaults. A new netns is the odd one out: it's born with nothing, not even loopback. Processes that want to talk to themselves via `127.0.0.1` (which is a huge fraction of real-world software — databases, web servers, test suites) will silently fail until `lo` is up. The one-line `ip link set lo up` is probably the most commonly-forgotten step in hand-rolled container networking.
+
+**Why rename `p<id>` to `eth0`?** Convention. Every program that hard-codes `eth0` (a lot of them, unfortunately) suddenly works. Docker does the same thing. The "proper" solution is to use any interface name and rely on routing, but convention wins.
+
+**Why the default route via the bridge IP?** When a packet in the container wants to leave the 172.42.0.0/24 subnet (say, to `8.8.8.8`), the kernel consults the route table. `default via 172.42.0.1` says "for anything I don't know about, send to the bridge IP." The bridge is in the host netns, so the packet lands in the host kernel, which then re-routes it via the external interface. This is how the container reaches the outside world at the IP layer.
+`─────────────────────────────────────────────────`
+
+---
+
+### 7d · NAT via iptables MASQUERADE — making return traffic work
+
+The container has an IP (`172.42.0.5` say) and a route to the gateway. But `172.42.0.0/24` is a **private RFC1918 range** — no router on the public internet knows how to route return packets to it. If we just let the packet out, it'd arrive at some server somewhere, and the reply would vanish into the void.
+
+The fix is **source NAT**, specifically MASQUERADE:
+
+```go
+// internal/network/nat.go
+iptables -t nat -A POSTROUTING -s 172.42.0.0/24 ! -o mydocker0 -j MASQUERADE
+```
+
+Reading this rule piece by piece:
+
+| Piece | Meaning |
+|---|---|
+| `-t nat` | Work in the NAT table (separate from filter/mangle tables). |
+| `-A POSTROUTING` | Append to the POSTROUTING chain — fires just before a packet leaves the host. |
+| `-s 172.42.0.0/24` | Match: source IP is in our container subnet. |
+| `! -o mydocker0` | Match: going *out* any interface except the bridge itself. |
+| `-j MASQUERADE` | Action: rewrite source IP to whatever the outgoing interface's IP is. |
+
+So when container `172.42.0.5` sends a packet destined for `8.8.8.8`:
+
+```
+1. Container kernel routes via default gateway 172.42.0.1
+2. Packet arrives at mydocker0 (host kernel)
+3. Host kernel routes via external interface (e.g., eth0 192.168.1.42)
+4. POSTROUTING fires: source 172.42.0.5 → rewritten to 192.168.1.42
+5. Packet leaves eth0 with source 192.168.1.42 — a real routable IP
+6. 8.8.8.8 replies to 192.168.1.42
+7. Host kernel NAT table remembers the mapping, rewrites dst back to 172.42.0.5
+8. Packet comes back into mydocker0, into the container
+```
+
+**Why `! -o mydocker0`?** Without this, container-to-container traffic within the subnet would *also* get masqueraded, which mangles source IPs when two containers on the same bridge talk to each other. The exclusion keeps bridge-internal traffic untouched and only NATs outbound-to-internet traffic.
+
+**Idempotency via `-C`:** `iptables -C` checks if a rule exists (exit 0) or not (exit 1). `EnsureNAT` tries `-C` first; only if absent does it `-A`. This lets us re-run `mydocker run` without duplicating the rule — each duplicate would slow down every packet by a small amount and accumulate over time.
+
+---
+
+### 7e · DNS — the simplest piece
+
+A container with an IP and a route can reach `8.8.8.8`, but can it resolve `example.com`? Not without a nameserver configured. That's `/etc/resolv.conf`:
+
+```go
+// internal/network/dns.go
+const resolvConfContents = `nameserver 8.8.8.8
+nameserver 1.1.1.1
+`
+
+func WriteResolvConf(rootfs string) error {
+    os.MkdirAll(filepath.Join(rootfs, "etc"), 0755)
+    os.WriteFile(filepath.Join(rootfs, "etc", "resolv.conf"), []byte(resolvConfContents), 0644)
+}
+```
+
+Two things worth noting:
+
+1. **We write to `rootfs/etc/resolv.conf` from the parent** — which is the merged overlay mount. That write lands in the container's **upperdir** (writable layer), so it overrides whatever the image's base layers had. Perfect — we don't mutate the image.
+2. **Hard-coded public resolvers.** Real Docker copies `/etc/resolv.conf` from the host (or runs an embedded DNS server for service discovery). Hard-coding `8.8.8.8`/`1.1.1.1` is the simplest thing that works and is the right call for now.
+
+---
+
+### 7f · The synchronization problem — why we added a sync pipe
+
+Now for the subtle bit. Network setup has to happen in a particular order:
+
+1. Child must be **created with `CLONE_NEWNET`** — gives us a netns.
+2. Child must exist (have a PID) before we can `ip link set <veth> netns <pid>`.
+3. But the child must **not execute the user's command** until networking is ready — otherwise the workload sees a half-built netns and might bail out ("no network").
+4. Parent must configure the cgroup, then network, then release the child.
+
+The race without synchronization:
+
+```
+[parent] cmd.Start()  ← child is alive, starts executing init()
+[parent] network.Setup() ...
+                            ← child could race ahead, mount /proc, exec the workload,
+                              and try to use eth0 before it exists
+```
+
+The fix is a **sync pipe** (FD 3):
+
+```go
+// internal/container/run.go
+pipeR, pipeW, err := os.Pipe()
+cmd.ExtraFiles = []*os.File{pipeR}    // becomes FD 3 in the child
+defer pipeW.Close()
+
+cmd.Start()
+pipeR.Close()                          // parent doesn't need the read end anymore
+
+cg.AddPID(...)
+state.ReadStartTime(...)
+network.Setup(...)
+c.Save()
+
+pipeW.Close()                          // signals the child: you may proceed
+```
+
+and on the child side:
+
+```go
+// internal/container/init.go
+func waitForParent() error {
+    syncFile := os.NewFile(3, "sync")
+    defer syncFile.Close()
+    if _, err := io.Copy(io.Discard, syncFile); err != nil {
+        return fmt.Errorf("read sync: %w", err)
+    }
+    return nil
+}
+
+func Init(rootfs string, args []string) error {
+    waitForParent()                    // FIRST thing init does — block until parent says go
+    // ... sethostname, setupRoot, setupMounts, exec workload ...
+}
+```
+
+**How it works:**
+
+1. Parent creates a pipe. Parent holds both ends.
+2. Parent passes the **read end** to the child via `ExtraFiles` → shows up as FD 3 in the child.
+3. Child's `waitForParent` does `io.Copy` from FD 3. This **blocks** — no data, no EOF, because parent still holds the write end.
+4. Parent does all the setup (cgroup, network, state save).
+5. Parent closes the write end. The kernel sees no one holds it → delivers **EOF** on the read side.
+6. Child's `io.Copy` returns (it copied zero bytes, got EOF), `waitForParent` returns, and init proceeds.
+
+`★ Insight ─────────────────────────────────────`
+**We never write data through the pipe.** We just use the fact that "writer closed" becomes EOF on the reader. This is a classic Unix "gate" idiom — the pipe is used as pure synchronization, not as a data channel. Go's `io.Copy(io.Discard, pipe)` is the idiomatic way: it reads until EOF and discards; the number of bytes is irrelevant.
+
+**Why FD 3 specifically?** When Go's `exec.Cmd` forks, `Stdin`/`Stdout`/`Stderr` occupy FDs 0/1/2 in the child. Entries in `ExtraFiles` are numbered starting at 3. So `ExtraFiles[0]` → FD 3, `ExtraFiles[1]` → FD 4, and so on. The child uses `os.NewFile(3, "sync")` to get an `*os.File` referencing that descriptor.
+
+**What if the parent crashes between Start and pipeW.Close()?** Great question. If the parent dies, the kernel closes *all* its open FDs — including pipeW. The child immediately gets EOF and proceeds. The child will try to run in an un-networked container, then probably crash, but it won't hang forever. Orphan cleanup then happens through the normal "PID 1 dies → kernel teardown of netns" path.
+`─────────────────────────────────────────────────`
+
+---
+
+### 7g · `Setup` and `Teardown` — the orchestration layer
+
+These two functions tie everything together and manage cleanup-on-partial-failure:
+
+```go
+// internal/network/setup.go
+func Setup(containerID, rootfs string, pid int) (string, error) {
+    EnsureBridge()
+    EnsureNAT()
+
+    ip, _ := AllocateIP(containerID)
+
+    if err := SetupVeth(containerID, pid, ip); err != nil {
+        ReleaseIP(containerID)                 // unwind: release the IP we just claimed
+        return "", err
+    }
+    if err := WriteResolvConf(rootfs); err != nil {
+        RemoveVeth(containerID); ReleaseIP(containerID)   // unwind further
+        return "", err
+    }
+    return ip, nil
+}
+
+func Teardown(containerID string) error {
+    var errs []error
+    if err := RemoveVeth(containerID); err != nil   { errs = append(errs, ...) }
+    if err := ReleaseIP(containerID); err != nil    { errs = append(errs, ...) }
+    return errors.Join(errs...)
+}
+```
+
+Two patterns worth noticing:
+
+1. **Unwind on error in `Setup`.** If `SetupVeth` succeeds but `WriteResolvConf` fails, we *already* claimed an IP and created a veth. Those need to be released, or we leak both. The pattern is ugly (three nested cleanup calls) but correct — each `if err` path unwinds everything that came before it.
+2. **`errors.Join` on `Teardown`.** Same as `rm.go` from M6: try everything, report everything. If veth removal fails, we still want to try releasing the IP.
+
+**What `Teardown` intentionally does *not* do:** remove the bridge or flush the NAT rule. The bridge and NAT are **shared infrastructure** across all containers. Tearing them down when one container exits would break every other running container. They're created once by `EnsureBridge`/`EnsureNAT` and kept around forever (well — until reboot; tmpfs isn't involved here, so they actually persist until the next boot).
+
+---
+
+### 7h · Integration into `run.go`
+
+The pieces slot into the sequence like this:
+
+```go
+// internal/container/run.go (simplified, focusing on M7 additions)
+Cloneflags: CLONE_NEWPID | NEWUTS | NEWNS | NEWIPC | CLONE_NEWNET  // ← added NEWNET
+
+cg.Create(limits)                                     // [M3]
+pipeR, pipeW, _ := os.Pipe()                          // [M7] sync pipe
+cmd.ExtraFiles = []*os.File{pipeR}
+
+cmd.Start()                                           // child is alive, blocked on FD 3
+pipeR.Close()                                         // parent's copy no longer needed
+
+cg.AddPID(cmd.Process.Pid)                            // [M3]
+startTime, _ := state.ReadStartTime(...)              // [M6]
+ip, _ := network.Setup(id, rootfs, cmd.Process.Pid)   // [M7] ← all the network plumbing
+state.Save(containerWithIP)                           // [M6] — now includes IP
+
+pipeW.Close()                                         // [M7] release the child — it proceeds
+
+// ... foreground: Wait(); on exit: state.Save + Teardown + cg.Destroy ...
+```
+
+And in `rm.go`:
+
+```go
+// internal/container/rm.go — added one more teardown step
+overlay.Unmount(c.ID)
+cg.Destroy()
+state.RemoveDir(c.ID)
+network.Teardown(c.ID)    // ← M7 addition: free the IP and delete veth
+```
+
+**The `Container` struct gained one field:**
+
+```go
+// internal/state/state.go
+type Container struct {
+    // ...
+    IP string `json:"ip,omitempty"`  // ← M7
+}
+```
+
+So `mydocker ps` can show the container's IP (once we update `ps.go` to display it — a nice small polish task).
+
+---
+
+### 7i · Why shell out to `ip` and `iptables` instead of using netlink?
+
+Every operation in the network package ultimately calls this:
+
+```go
+// internal/network/bridge.go — the universal command wrapper
+func run(cmd string, args ...string) error {
+    c := exec.Command(cmd, args...)
+    var stderr bytes.Buffer
+    c.Stderr = &stderr
+    if err := c.Run(); err != nil {
+        return fmt.Errorf("%s %v: %w: %s",
+            cmd, args, err, strings.TrimSpace(stderr.String()))
+    }
+    return nil
+}
+```
+
+Go has a real netlink library (`vishvananda/netlink`) that talks the rtnetlink protocol directly — the same protocol `ip` uses under the hood. Why didn't we use it?
+
+**For learning:** shelling out is transparent. Every line of `network/veth.go` corresponds to a command you can type and test manually. If it breaks, you debug with `ip link show`, `ip netns exec <id> ip a`, `iptables -t nat -L -n` — actual tools you'll use for the rest of your career. Netlink would hide the semantics behind a Go API.
+
+**For reliability:** `ip` and `iptables` are stable, well-maintained, and ship with every distro. The netlink library has rough edges around newer kernel features, and binding versions can drift.
+
+**What we give up:** performance (each command is a process fork + exec) and granularity (error handling is string-matching on stderr, which is fragile — you can see this in `veth.go`'s `strings.Contains(err.Error(), "does not exist")`). For a learning project, the trade is fine.
+
+`★ Insight ─────────────────────────────────────`
+**`exec.Command` with stderr capture is a 10-line pattern that pays forever.** The naive version (`c.Run()` only) gives you `exit status 2` and nothing else. The improved version attaches a `bytes.Buffer` to `Stderr`, runs, and wraps the error with the stderr text. Suddenly every failure message tells you *what actually went wrong*: "RTNETLINK answers: File exists", "Cannot find device 'pabc'", etc. It's the single most valuable hygiene improvement for any Go code that shells out.
+`─────────────────────────────────────────────────`
+
+---
+
+### M7 summary — what each file owns
+
+| File | Responsibility | One-line summary |
+|---|---|---|
+| `ip.go` | IP allocation + persistence | First free IP in the subnet, tracked in a JSON file |
+| `bridge.go` | Bridge lifecycle (shared) | Create `mydocker0` once, turn IP forwarding on |
+| `veth.go` | Per-container L2 plumbing | Six-step dance: create pair, move into netns, plug into bridge, configure inside |
+| `nat.go` | MASQUERADE rule (shared) | One iptables rule so container traffic can reach the internet |
+| `dns.go` | `/etc/resolv.conf` | Two hard-coded public resolvers written into the container's rootfs |
+| `setup.go` | Orchestration | `Setup` wires all of the above; `Teardown` unwinds the per-container pieces |
+
+The three ideas tying it all together:
+
+1. **Bridge + veth pairs are how every container runtime does L2** — this isn't a mydocker-specific design, it's literally how `docker0` and Docker's container networking work. You can run `ip link show` on a host with Docker and see the same shape: `docker0` bridge, plus a `veth*@ifN` for each running container.
+2. **The kernel's routing stack + iptables NAT is what connects a private subnet to the internet** — once you internalize this, Docker's network stack, Kubernetes' pod-to-pod networking, and any VPN you've ever configured all start to feel familiar.
+3. **Synchronization between parent and child is almost as important as the networking itself** — the sync pipe is a tiny amount of code that prevents a whole class of subtle bugs where the workload starts before the network is ready.
+
+---
+
 ## Putting it all together — commands across milestones
 
 ### `mydocker pull alpine:3.19`
@@ -1122,22 +1579,35 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
            ▼
 [parent] overlay.Mount(id, layers)                   ← stacked rootfs → mergedPath
 [parent] cgroup.Create(limits)                       ← mkdir + write memory.max, cpu.max
-[parent] exec.Command("/proc/self/exe", "init", ...) ← with CLONE_NEWPID|NEWNS|NEWUTS|NEWIPC
+[parent] os.Pipe() → cmd.ExtraFiles = {pipeR}        ← [M7] sync pipe as FD 3 in child
+[parent] exec.Command("/proc/self/exe", "init", ...) ← with CLONE_NEWPID|NEWNS|NEWUTS|NEWIPC|NEWNET
 [parent] cg.AddPID(child.Pid)
 [parent] state.ReadStartTime(child.Pid)              ← record the (PID, StartTime) identity
-[parent] Container.Save()                            ← state.json, atomic write
+[parent] network.Setup(id, rootfs, child.Pid)        ← [M7] bridge+veth+NAT+DNS
+           │
+           │   EnsureBridge   → ip link add mydocker0 + IP + up + ip_forward=1
+           │   EnsureNAT      → iptables -A POSTROUTING MASQUERADE
+           │   AllocateIP     → pick first free 172.42.0.N
+           │   SetupVeth      → create pair, move peer into child's netns, configure eth0
+           │   WriteResolvConf → drop 8.8.8.8/1.1.1.1 into rootfs/etc/resolv.conf
+           ▼
+[parent] Container.Save() (with IP)                  ← state.json, atomic write
+[parent] pipeW.Close()                               ← [M7] EOF on FD 3 — child unblocks
 [parent] signal.Notify(SIGINT/SIGTERM) → forward     ← let the user's Ctrl-C reach the child
 [parent] Wait()
              │
              ▼
-        [child=PID 1 in ns] sethostname, setupRoot, setupMounts
+        [child=PID 1 in ns] waitForParent (blocks on FD 3 until EOF)
+        [child] sethostname, setupRoot, setupMounts
         [child] exec.Command(user's binary).Start()  ← init stays alive as PID 1
+        [child] signal.Notify(SIGCHLD) → Wait4(-1, WNOHANG) loop   ← zombie reaping
         [child] signal.Notify(SIGTERM/INT/QUIT/HUP/USR1/USR2) → forward to user proc
-        [child] Wait() on user proc → os.Exit(code)
+        [child] when direct child exits → os.Exit(128+sig OR exit code)
              │
              ▼  (user exits / stop / crash)
 [parent] state.Status = "exited", ExitCode, FinishedAt
 [parent] Container.Save()                            ← final state persisted
+[parent] network.Teardown(id)                        ← [M7] remove veth + release IP
 [parent] overlay.Unmount(id)                         ← tear down merged (state dir stays!)
 [parent] cg.Destroy()
 ```
@@ -1161,19 +1631,18 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
    → state.Find → IsRunning? → SIGTERM → waitForExit(10s) → SIGKILL → reconcileExited
 
 [user] mydocker rm <id>
-   → overlay.Unmount + cgroup.Destroy + state.RemoveDir (errors.Join all three)
+   → overlay.Unmount + cgroup.Destroy + state.RemoveDir + network.Teardown (errors.Join)
 ```
 
 ---
 
-## What's next (milestones 7–10)
+## What's next (milestones 8–10)
 
 | # | What | Why it's the logical next step |
 |---|------|-------------------------------|
-| 7 | **Networking** (veth, bridge, NAT) | The big one. `CLONE_NEWNET` + creating a veth pair + a bridge + iptables NAT so containers can reach the internet. |
-| 8 | Volumes | Bind mounts from host into container — trivial *mechanically*, fiddly in UX. |
-| 9 | Daemon architecture | Split `mydocker` into CLI + daemon with a Unix socket API — this also solves M6's state-on-reboot problem. |
-| 10 | CLI polish | Cobra, better errors, maybe `logs -f` / `exec` / `inspect`. |
+| 8 | **Volumes** (bind mounts) | Let users persist data between container runs or share dirs with the host. Mechanically it's a `unix.Mount(MS_BIND, ...)` before `setupMounts`, but the UX (`-v host:container[:ro]`) is fiddly. |
+| 9 | **Daemon architecture** | Split `mydocker` into CLI + daemon with a Unix socket API. Solves M6's state-on-reboot gap *and* M7's stale-IP-allocations gap, because a daemon can reconcile once on startup. |
+| 10 | CLI polish | Cobra, better errors, maybe `logs -f` / `exec` / `inspect` / `ps` with IP column. |
 
 ---
 
@@ -1193,3 +1662,12 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
 - Why did we keep `/var/lib/mydocker/containers/` on tmpfs even though it now holds `state.json` (persistent-looking data)? What specifically would break if we moved it to disk without *also* adding a reconciliation pass on startup?
 - `ps` reconciles stale "running" status at read time. What fails if two `mydocker` processes run `ps` simultaneously and both try to `Save()` the same container's state? Is this actually a problem in our use case?
 - `rm` doesn't verify that overlay unmount succeeded before removing the state directory. What's the worst case if the unmount fails silently? (Hint: mount point vs state dir are sibling paths.)
+
+### New to M7
+- `allocated_ips.json` persists to real disk, but `mydocker0`, veth pairs, and iptables rules live only in the kernel — which gets wiped on reboot. What's the observable user-visible failure after, say, 254 reboots (each with one short-lived container), and what's the cheapest fix that doesn't require a daemon? (Hint: there are two different fixes; one reconciles at allocation time, the other relocates the file.)
+- If two `mydocker run` invocations race — both read `allocated_ips.json` before either writes back — they can hand out the same IP to two containers. Walk through what happens: does the second container fail immediately, fail on first packet, or silently corrupt the first container's traffic? What's the usual fix, and why didn't we bother?
+- We close the sync pipe *after* `state.Save()`. What failure mode are we protecting against by making the child wait that long — versus releasing it right after `network.Setup`?
+- Trace a TCP connection from container `172.42.0.5` to `1.1.1.1:443`, listing every table/chain/interface it touches on the way out and every rule that rewrites the packet on the way back. Which of those steps would break if we forgot to flip `net.ipv4.ip_forward=1`?
+- `iptables -t nat -A POSTROUTING ... ! -o mydocker0 -j MASQUERADE` excludes traffic going back out via the bridge. Why exactly — what specifically breaks if you remove the `! -o mydocker0` and just MASQUERADE everything from the subnet?
+- We use `nsenter -t <pid> -n` to configure the container's interface from outside. What goes wrong if the container's PID 1 dies between `cmd.Start()` and our last `nsenter` call? (Hint: what happens to a netns when all its members have exited?)
+- DNS hard-codes `8.8.8.8`/`1.1.1.1`. If the host is on a corporate network that blocks external DNS but offers its own resolver at `10.0.0.53`, every container breaks. What's the minimum-viable fix — and why does the "just copy the host's `/etc/resolv.conf`" answer have a subtle pitfall? (Hint: `127.0.0.53` systemd-resolved entries.)
