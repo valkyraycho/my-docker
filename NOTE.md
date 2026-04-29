@@ -1551,6 +1551,398 @@ The three ideas tying it all together:
 
 ---
 
+## Milestone 8 — Volumes (bind mounts + named volumes)
+
+**The core change:** users can now keep data *outside* the container's writable overlay upperdir. Two flavors, both exposed via the same `-v src:dst[:ro]` flag:
+
+- **Bind mount** — `"/host/data:/app/data"` — a specific host path is visible inside the container at a specific target path. Great for sharing code into a dev container, exposing config files, sharing secrets.
+- **Named volume** — `"pgdata:/var/lib/postgres"` — mydocker owns the storage under `/var/lib/mydocker/volumes/<name>/_data`, and the user just refers to it by name. Great for persistent application data (databases, caches) that needs to outlive a container but doesn't need a specific host path.
+
+Mechanically, both are the *same* operation inside the kernel (a `MS_BIND` mount). The only difference is where the source path comes from — directly from the user for bind mounts, from a managed path for named volumes.
+
+```
+┌─ Bind mount ──────────────┐      ┌─ Named volume ─────────────┐
+│ /host/data                │      │ /var/lib/mydocker/volumes/ │
+│   └── file.txt            │      │   └── pgdata/_data/        │
+│       │ (MS_BIND)         │      │       │ (MS_BIND)          │
+│       ▼                   │      │       ▼                    │
+│ container:/app/data       │      │ container:/var/lib/postgres│
+│   └── file.txt            │      │                            │
+└───────────────────────────┘      └────────────────────────────┘
+```
+
+---
+
+### 8a · The `Spec` data model — kind + source + target + mode
+
+```go
+// internal/volume/parse.go
+type Kind int
+const (
+    Bind Kind = iota
+    Named
+)
+
+type Spec struct {
+    Kind     Kind
+    Source   string   // host path (Bind) or volume name (Named)
+    Target   string   // absolute path inside the container
+    ReadOnly bool
+}
+```
+
+Four fields. The `Kind` enum flattens "bind or named" into one type instead of using two structs plus an interface — a fine choice for something this small. If we ever add more volume types (tmpfs-backed, nfs, …), this becomes a switch in `Mount`. For two variants, no interface is warranted.
+
+---
+
+### 8b · `Parse` — all the validation in one place
+
+The `-v` flag value is free-form text; `Parse` is the chokepoint that turns it into a validated `Spec`:
+
+```go
+// internal/volume/parse.go (annotated)
+func Parse(s string) (*Spec, error) {
+    parts := strings.Split(s, ":")
+    if len(parts) != 2 && len(parts) != 3 {
+        return nil, fmt.Errorf("invalid volume spec %q: expected src:dst[:mode]", s)
+    }
+    source, target := parts[0], parts[1]
+
+    // Non-empty, target absolute.
+    if source == "" { return nil, errors.New("volume spec: source is empty") }
+    if target == "" { return nil, errors.New("volume spec: target is empty") }
+    if !strings.HasPrefix(target, "/") {
+        return nil, fmt.Errorf("volume spec: target %q must be absolute", target)
+    }
+
+    // Optional mode.
+    var readOnly bool
+    if len(parts) == 3 {
+        switch parts[2] {
+        case "ro": readOnly = true
+        case "rw": readOnly = false
+        default:   return nil, fmt.Errorf("mode %q must be 'ro' or 'rw'", parts[2])
+        }
+    }
+
+    // Kind is inferred from the shape of the source.
+    var kind Kind
+    if strings.HasPrefix(source, "/") {
+        kind = Bind
+    } else {
+        if strings.Contains(source, "/") {
+            return nil, errors.New("named volume must not contain slashes")
+        }
+        kind = Named
+    }
+
+    return &Spec{Kind: kind, Source: source, Target: target, ReadOnly: readOnly}, nil
+}
+```
+
+Three things worth naming about this function's *shape*:
+
+1. **Kind is inferred, not explicit.** "Starts with `/`" means bind; otherwise named. This matches Docker's convention. Users don't have to say `bind:/host:/container` vs `named:foo:/container` — the path tells you.
+2. **Target must be absolute.** Because we're going to `filepath.Join(rootfs, target)` inside `Mount`. A relative target would silently resolve against the current working directory and mount in the wrong place. Validating at parse time means `Mount` never has to worry about it.
+3. **Named volumes can't contain `/`.** This is how we separate "user put a typo in a bind path" from "user is naming a volume". `my/volume` isn't a valid name because it'd be ambiguous in our on-disk layout (`volumes/my/volume/_data` vs `volumes/my%2Fvolume/_data`).
+
+`★ Insight ─────────────────────────────────────`
+**Parsing functions are the ideal first thing to unit-test in any project** — and M8 is where we finally do it (`parse_test.go`). Why? Three reasons:
+
+1. They're *pure*: input string in, output struct out, no I/O, no syscalls, no side effects. Tests run in microseconds with no fixtures.
+2. They're *boundary code*: every weird user input hits `Parse` first. Every bug here becomes a runtime confusion five functions deep. Catching malformed input at the boundary is defense-in-depth.
+3. They have *clear specs*: "valid if X, error containing Y if not." Writing these tests forces you to enumerate the negative cases, which forces you to actually think about edge cases.
+
+The test file uses the idiomatic **table-driven pattern**: one slice of structs, each describing `{input, want, wantErr}`, looped with `t.Run(tt.name, ...)`. Adding a new case is one line. This is the Go style for any test function that wants to grow.
+`─────────────────────────────────────────────────`
+
+---
+
+### 8c · `EnsureNamed` — the named-volume lifecycle
+
+```go
+// internal/volume/volume.go
+const volumesDir = "/var/lib/mydocker/volumes"
+
+func EnsureNamed(name string) (string, error) {
+    if strings.HasPrefix(name, ".") {
+        return "", fmt.Errorf("volume name %q cannot start with '.'", name)
+    }
+    dataDir := NamedPath(name)              // /var/lib/mydocker/volumes/<name>/_data
+
+    if err := os.MkdirAll(dataDir, 0755); err != nil {
+        return "", fmt.Errorf("mkdir %s: %w", dataDir, err)
+    }
+    return dataDir, nil
+}
+
+func NamedPath(name string) string {
+    return filepath.Join(volumesDir, name, "_data")
+}
+```
+
+The `_data` subdir is deliberate: it leaves room for sibling metadata in the future (a `opt.json` for volume driver options, labels, owner, etc. — the way Docker does). Today we don't have metadata, but the layout is ready for it.
+
+**Forbidding `.`-prefixed names** blocks two classes of mischief:
+- `.` and `..` — let the user accidentally escape the volumes dir via `filepath.Join`.
+- Hidden names that resemble filesystem detritus (`.DS_Store`, `.bashrc`).
+
+**Idempotent creation.** `EnsureNamed` always `MkdirAll`s — whether the volume existed before this call or not, the data dir exists when we return. That's why `Mount` can call it unconditionally on every container start, no bookkeeping needed.
+
+---
+
+### 8d · `Mount` — the three-line syscall + the readonly gotcha
+
+```go
+// internal/volume/mount.go
+func Mount(spec *Spec, rootfs string) error {
+    var source string
+    switch spec.Kind {
+    case Bind:  source = spec.Source
+    case Named: source, _ = EnsureNamed(spec.Source)
+    }
+
+    target := filepath.Join(rootfs, spec.Target)
+    os.MkdirAll(target, 0755)
+
+    // Step 1: bind-mount source onto target. Both must exist.
+    if err := unix.Mount(source, target, "", unix.MS_BIND, ""); err != nil {
+        return fmt.Errorf("mount %s to %s: %w", source, target, err)
+    }
+
+    // Step 2: if readonly requested, REMOUNT as readonly.
+    if spec.ReadOnly {
+        if err := unix.Mount("", target, "",
+            unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+            _ = unix.Unmount(target, unix.MNT_DETACH)
+            return fmt.Errorf("remount %s for readonly: %w", target, err)
+        }
+    }
+    return nil
+}
+```
+
+This function is where every interesting Linux-mount gotcha lives. Four in particular:
+
+**1. The readonly remount dance.** This one trips up every container-runtime author exactly once. You'd expect this to work:
+
+```go
+unix.Mount(source, target, "", unix.MS_BIND|unix.MS_RDONLY, "")    // DOESN'T WORK
+```
+
+It doesn't. The kernel **silently ignores `MS_RDONLY`** when you pass it together with `MS_BIND` on the first bind. The mount succeeds, but it's read-write. This is a long-standing kernel quirk — the rationale is that `MS_BIND` creates a *new reference* to an existing superblock, and you can only change the readonly-ness of a mount by remounting. So:
+
+- **First call:** bind-mount read-write. Mount exists.
+- **Second call:** remount the *mount point* with `MS_BIND|MS_REMOUNT|MS_RDONLY`. Note `source=""` — we're not binding anything new, just changing attributes on the mount that's already there.
+
+If the remount fails (rare, but possible — e.g., the underlying FS is mounted readonly and we tried to remount rw over it), we tear down the first bind to avoid leaving a leaked read-write mount.
+
+**2. `MkdirAll(target, 0755)` before mounting.** The target *must* exist as a directory (or file, for file binds). If the target doesn't exist, `mount(2)` returns `ENOENT`. Creating it lives in the container's overlay upperdir, so no host files are touched and the layer below is unaffected.
+
+**3. Target exists in the overlay merged view.** When we `filepath.Join(rootfs, spec.Target)`, `rootfs` is the overlay's merged mount (e.g., `/var/lib/mydocker/containers/<id>/merged`). So we're carving a mount point *inside the overlay*, which has an important consequence for ordering — see the next section.
+
+**4. `MNT_DETACH` on the cleanup path.** If the remount fails, we unmount with `MNT_DETACH` (lazy unmount) rather than the default sync unmount. `MNT_DETACH` removes the mount from the filesystem tree immediately but waits for any in-use references to drain before actually releasing the superblock. For cleanup paths it's the safer choice — a plain unmount can fail with `EBUSY` if anything has the path open.
+
+---
+
+### 8e · Why volumes mount *before* the child starts — the CLONE_NEWNS interaction
+
+Look at the sequence in `run.go`:
+
+```go
+// internal/container/run.go (simplified order)
+cg.Create(...)
+
+for _, spec := range opts.Volumes {           // ← volumes mounted in PARENT's mount ns
+    volume.Mount(spec, opts.Rootfs)           //   onto merged path BEFORE child exists
+}
+
+pipe, _, _ := os.Pipe()
+cmd.ExtraFiles = []*os.File{pipe}
+cmd.Start()                                   // ← child clones with CLONE_NEWNS
+                                              //   inherits parent's mount tree as its initial state
+
+// ... cgroup, state, network setup ...
+
+pipeW.Close()                                 // ← child unblocks, runs setupRoot → pivot_root
+```
+
+And in the child (`init.go → setupRoot`):
+
+```go
+unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, "")   // make ns private
+unix.Mount(rootfs, rootfs, "", unix.MS_BIND|unix.MS_REC, "") // bind rootfs to itself
+unix.PivotRoot(rootfs, oldRoot)                             // swap roots
+```
+
+Now trace what happens to a volume mount:
+
+```
+Parent's mount ns (right after volume.Mount):
+  /var/lib/mydocker/containers/<id>/merged/          ← overlay
+  /var/lib/mydocker/containers/<id>/merged/app/data/ ← bind mount from /host/data
+
+─── child is cloned with CLONE_NEWNS ───
+Child's mount ns (identical initial state):
+  /var/lib/mydocker/containers/<id>/merged/
+  /var/lib/mydocker/containers/<id>/merged/app/data/ ← still here, shared initially
+
+─── child runs setupRoot ───
+  Mount("", "/", MS_PRIVATE|MS_REC)   ← detach propagation
+  Mount(rootfs, rootfs, MS_BIND|MS_REC) ← rootfs becomes its own mount point (needed for pivot_root)
+                                          the MS_REC makes this RECURSIVE — it pulls in all
+                                          submounts, including /app/data
+  PivotRoot(rootfs, oldRoot)
+
+Child after pivot_root:
+  /app/data/                          ← (was rootfs/app/data) still bind-mounted to /host/data
+```
+
+**The crucial detail is `MS_REC` on the rootfs bind.** Without it, `pivot_root` would succeed but the sub-bind-mounts would be left behind in the "old root" (which we then `MNT_DETACH` away — killing the volume mounts). With `MS_REC`, the sub-mounts are *recursively* carried along into the pivoted root.
+
+If you've ever wondered why M2's `setupRoot` has `MS_BIND|MS_REC` rather than just `MS_BIND` — this is why. It's been ready for M8 since M2.
+
+`★ Insight ─────────────────────────────────────`
+**Mounting in the parent before clone is the simpler choice.** The alternative is: pass the `Spec` list into the child via stdin/env/file, and have the child mount inside its own namespace after `pivot_root`. That works too, and Docker actually does it this way. The advantage: the mounts are scoped to the child's namespace from the start, and they automatically disappear when the namespace is destroyed (no cleanup needed on crash).
+
+We chose parent-side mounting because our volume cleanup path runs on `rm`, and we have the container ID + rootfs path handy there anyway. The trade-off: if the parent crashes between `volume.Mount` and `cmd.Start`, the mounts leak on the host. Mitigation would be cleaning them up in an error path in `Run`.
+`─────────────────────────────────────────────────`
+
+---
+
+### 8f · Unwind on partial failure — a pattern you've now seen three times
+
+From `run.go`:
+
+```go
+var mountedSoFar []*volume.Spec
+for _, spec := range opts.Volumes {
+    if err := volume.Mount(spec, opts.Rootfs); err != nil {
+        for _, prev := range mountedSoFar {    // undo everything we mounted up to this point
+            _ = volume.Unmount(prev, opts.Rootfs)
+        }
+        cg.Destroy()                           // and undo the cgroup we created before the loop
+        return fmt.Errorf("mount volume %s:%s: %w", spec.Source, spec.Target, err)
+    }
+    mountedSoFar = append(mountedSoFar, spec)
+}
+```
+
+This is the third time we've seen this general shape:
+
+| Milestone | Where | The "N things" |
+|---|---|---|
+| M5 | `image.Pull` | N blob downloads — if layer 3 of 5 fails, the already-extracted ones stay (they're content-addressed, safe to keep) |
+| M7 | `network.Setup` | IP alloc, veth, resolv.conf — if any step fails, unwind the earlier ones |
+| M8 | `volume.Mount` loop | If volume N fails, unmount volumes 1..N-1 |
+
+The general pattern: when you do a sequence of operations that each claim resources, keep a list of what you succeeded at, and on the first failure, walk the list backwards releasing each. In Go, the explicit slice (`mountedSoFar`) is idiomatic; in languages with deferred cleanup (C++ RAII, Rust's `Drop`), you'd write a helper type with a destructor. Both solve the same problem.
+
+The trap to avoid: doing the cleanup inside a `defer` without also disarming it on success. Too easy to accidentally unmount everything *after* a successful run.
+
+---
+
+### 8g · Repeatable flags — how `-v` takes multiple values
+
+```go
+// cmd/mydocker/repeatable_flags.go
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string  { return strings.Join(*s, ",") }
+func (s *stringSliceFlag) Set(v string) error {
+    *s = append(*s, v)
+    return nil
+}
+```
+
+Go's stdlib `flag` package only supports one value per flag by default. Passing `-v a -v b` with a plain `fs.String` would keep the *last* value and throw away the first. To accept repetition, we implement the **`flag.Value` interface** (two methods: `String` and `Set`), and each invocation of `-v` calls `Set`, appending to the slice.
+
+Used like:
+
+```go
+var volumeSpecs stringSliceFlag
+fs.Var(&volumeSpecs, "v", "volume mount (repeatable): src:dst[:ro]")
+```
+
+After `fs.Parse`, `volumeSpecs` is a `[]string` with every `-v` value in order.
+
+This is the smallest piece of M8 but probably the most broadly reusable pattern in the whole project — any time you need `-flag x -flag y -flag z` with stdlib flags, this is the three lines of code.
+
+---
+
+### 8h · Integration — where volumes slot into the lifecycle
+
+**`RunOptions` grows a field:**
+
+```go
+// internal/container/run.go
+type RunOptions struct {
+    // ... existing ...
+    Volumes []*volume.Spec
+}
+```
+
+**Mount order in `Run`:** volumes are mounted *after* the cgroup is created but *before* the child is started (so `CLONE_NEWNS` carries them into the child).
+
+**`Container` state persists the specs:**
+
+```go
+// internal/state/state.go
+type Container struct {
+    // ... existing ...
+    Volumes []*volume.Spec `json:"volumes,omitempty"`
+}
+```
+
+This is important for `rm` — when we remove a container, we need to know *which* bind mounts to unmount from its overlay. Without persisting, we'd have to either unmount everything in the merged path (overbroad) or require the user to repeat the `-v` flags to `rm` (terrible UX).
+
+**`rm.go` unmounts volumes before unmounting the overlay:**
+
+```go
+// internal/container/rm.go
+for _, spec := range c.Volumes {
+    volume.Unmount(spec, overlay.MergedPath(c.ID))   // ← new helper exposing the merged path
+}
+overlay.Unmount(c.ID)
+```
+
+**Why this order matters:** the overlay can't be unmounted while there's still a bind mount *on top of it*. `unmount(2)` returns `EBUSY`. Unmounting the volumes first peels them off, then the overlay can unmount cleanly.
+
+**`overlay.MergedPath(id)` is new:** a small helper that exposes the merged path without re-mounting. Previously `overlay.Mount` was the only way to get that path; now we need it at `rm` time too.
+
+```go
+// internal/overlay/overlay.go
+func MergedPath(containerID string) string {
+    return filepath.Join(containersDir, containerID, "merged")
+}
+```
+
+Tiny function, real separation-of-concerns: the *path format* is now defined in one place.
+
+---
+
+### M8 summary — what each file owns
+
+| File | Responsibility | Key idea |
+|---|---|---|
+| `parse.go` | Turn `-v` text into a validated `Spec` | Kind inferred from shape of source; target must be absolute |
+| `parse_test.go` | Lock down parser behavior | First table-driven tests in the project — the template for all future parse tests |
+| `volume.go` | Named-volume lifecycle | `/var/lib/mydocker/volumes/<name>/_data/`, idempotent `EnsureNamed` |
+| `mount.go` | Do the actual bind mount | `MS_BIND`, then `MS_REMOUNT|MS_RDONLY` if readonly |
+| `cmd/mydocker/repeatable_flags.go` | Let `-v` appear multiple times | `flag.Value` impl: `Set` appends to a slice |
+| `overlay/overlay.go` | Expose `MergedPath` | So `rm` can unmount volumes without re-mounting the overlay |
+| `container/run.go` | Mount volumes, save them in state | Unwind-on-partial-failure pattern |
+| `container/rm.go` | Unmount volumes before overlay | Order matters: submounts must unmount first |
+| `state/state.go` | Persist the spec list | So `rm` can reverse what `run` did |
+
+The three big ideas tying it together:
+
+1. **`MS_BIND` is the universal primitive** — bind mounts are how Docker does volumes, how `pivot_root` gets a valid new root, how host paths are injected into containers. Every volume operation in every container runtime is some decoration on top of bind mounts.
+2. **The readonly-remount quirk is a kernel interface reality**, not an mydocker quirk — if you ever write infrastructure that touches mounts, you'll meet it again.
+3. **Parent-side mounts + `MS_REC` on the rootfs bind = volumes inherited by the child** — this is why `setupRoot` has `MS_REC` from day 1 (M2). The design decision paid dividends six milestones later.
+
+---
+
 ## Putting it all together — commands across milestones
 
 ### `mydocker pull alpine:3.19`
@@ -1579,6 +1971,8 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
            ▼
 [parent] overlay.Mount(id, layers)                   ← stacked rootfs → mergedPath
 [parent] cgroup.Create(limits)                       ← mkdir + write memory.max, cpu.max
+[parent] for each -v spec:                           ← [M8] volume mounts
+           volume.Mount(spec, mergedPath)            ← MS_BIND onto merged (+ MS_REMOUNT|MS_RDONLY if :ro)
 [parent] os.Pipe() → cmd.ExtraFiles = {pipeR}        ← [M7] sync pipe as FD 3 in child
 [parent] exec.Command("/proc/self/exe", "init", ...) ← with CLONE_NEWPID|NEWNS|NEWUTS|NEWIPC|NEWNET
 [parent] cg.AddPID(child.Pid)
@@ -1612,6 +2006,10 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
 [parent] cg.Destroy()
 ```
 
+> Note: in the foreground path above, volume mounts are torn down lazily on `mydocker rm`,
+> not on container exit — same as the overlay and state dir. `rm` unmounts volumes first,
+> then the overlay (sub-mounts block parent unmount otherwise).
+
 ### `mydocker run -d alpine:3.19 /bin/sleep 3600` (detached)
 
 ```
@@ -1631,18 +2029,18 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
    → state.Find → IsRunning? → SIGTERM → waitForExit(10s) → SIGKILL → reconcileExited
 
 [user] mydocker rm <id>
+   → for spec in c.Volumes: volume.Unmount(spec, MergedPath(id))   ← [M8] first
    → overlay.Unmount + cgroup.Destroy + state.RemoveDir + network.Teardown (errors.Join)
 ```
 
 ---
 
-## What's next (milestones 8–10)
+## What's next (milestones 9–10)
 
 | # | What | Why it's the logical next step |
 |---|------|-------------------------------|
-| 8 | **Volumes** (bind mounts) | Let users persist data between container runs or share dirs with the host. Mechanically it's a `unix.Mount(MS_BIND, ...)` before `setupMounts`, but the UX (`-v host:container[:ro]`) is fiddly. |
-| 9 | **Daemon architecture** | Split `mydocker` into CLI + daemon with a Unix socket API. Solves M6's state-on-reboot gap *and* M7's stale-IP-allocations gap, because a daemon can reconcile once on startup. |
-| 10 | CLI polish | Cobra, better errors, maybe `logs -f` / `exec` / `inspect` / `ps` with IP column. |
+| 9 | **Daemon architecture** | Split `mydocker` into CLI + daemon with a Unix socket API. Solves M6's state-on-reboot gap *and* M7's stale-IP-allocations gap, because a daemon can reconcile once on startup. Also gives us a natural place to host a `volume ls` / `volume rm` subcommand. |
+| 10 | CLI polish | Cobra, better errors, maybe `logs -f` / `exec` / `inspect` / `ps` with IP + mounts columns / `volume ls` / `volume prune`. |
 
 ---
 
@@ -1671,3 +2069,11 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
 - `iptables -t nat -A POSTROUTING ... ! -o mydocker0 -j MASQUERADE` excludes traffic going back out via the bridge. Why exactly — what specifically breaks if you remove the `! -o mydocker0` and just MASQUERADE everything from the subnet?
 - We use `nsenter -t <pid> -n` to configure the container's interface from outside. What goes wrong if the container's PID 1 dies between `cmd.Start()` and our last `nsenter` call? (Hint: what happens to a netns when all its members have exited?)
 - DNS hard-codes `8.8.8.8`/`1.1.1.1`. If the host is on a corporate network that blocks external DNS but offers its own resolver at `10.0.0.53`, every container breaks. What's the minimum-viable fix — and why does the "just copy the host's `/etc/resolv.conf`" answer have a subtle pitfall? (Hint: `127.0.0.53` systemd-resolved entries.)
+
+### New to M8
+- Imagine a user runs `mydocker run -v /etc:/host-etc:ro alpine sh`, then inside the container does `touch /host-etc/foo`. What happens, and which of the two layers of defense (`MS_RDONLY`, the overlay being read-write) is actually doing the work? Now imagine they do `mount -o remount,rw /host-etc` from inside — does that work? (Hint: look up "locked mount" in the kernel docs.)
+- We mount volumes *in the parent's namespace before `CLONE_NEWNS`* and rely on `MS_REC` in `setupRoot`'s bind-mount of rootfs to carry them through `pivot_root`. If you accidentally drop the `MS_REC`, what exactly do you observe inside the container — the volume mount missing, or something weirder?
+- `volume.Mount` calls `os.MkdirAll(target, 0755)` before mounting. That target lives inside the overlay merged view, so the `mkdir` writes to the overlay upperdir. When the container exits but the state dir is kept (as M6 decided), what happens on `mydocker rm` — does the `mkdir`'d directory get cleaned up, leaked in the upperdir, or something else? Trace through `overlay.Unmount` + `state.RemoveDir` to find out.
+- `Spec` is persisted to `state.json` via `json.Marshal`. `Kind` is an `int` enum (`Bind = 0`, `Named = 1`). What happens if you later reorder the enum constants — say, add `Tmpfs` at position 0, pushing `Bind` to 1? What does this tell you about serializing enums?
+- If the same source path is bind-mounted into two containers simultaneously (say `-v /var/log:/logs` in both), what coordination exists between them? What happens if one container's process writes a file while the other is reading it? (There's no mydocker-specific answer here — the question is purely about Linux bind mount semantics.)
+- Named volume directories under `/var/lib/mydocker/volumes/` are never cleaned up — even after the last container that used them is `rm`'d. Compare this to how containers/blobs work. What *should* the policy be, and what command would the user run to trigger it? (Hint: `docker volume prune`.)
