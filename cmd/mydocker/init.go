@@ -8,10 +8,11 @@ import (
 )
 
 var initCmd = &cobra.Command{
-	Use:    "init <rootfs> <cmd> [args...]",
-	Short:  "Container entrypoint (internal use only)",
-	Hidden: true,
-	Args:   cobra.MinimumNArgs(2),
+	Use:                "init <rootfs> <cmd> [args...]",
+	Short:              "Container entrypoint (internal use only)",
+	Hidden:             true,
+	Args:               cobra.MinimumNArgs(2),
+	DisableFlagParsing: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return container.Init(args[0], args[1:])
 	},

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/valkyraycho/my-docker/internal/cgroup"
@@ -24,6 +25,7 @@ var (
 	runPidsMax int
 	runDetach  bool
 	runVolumes []string
+	runEnv     []string
 )
 
 var runCmd = &cobra.Command{
@@ -84,6 +86,17 @@ var runCmd = &cobra.Command{
 			specs = append(specs, spec)
 		}
 
+		var envs []string
+		for _, e := range runEnv {
+			if strings.Contains(e, "=") {
+				envs = append(envs, e)
+			} else {
+				if val, ok := os.LookupEnv(e); ok {
+					envs = append(envs, e+"="+val)
+				}
+			}
+		}
+
 		opts := container.RunOptions{
 			ContainerID: containerID,
 			Image:       ref,
@@ -93,6 +106,7 @@ var runCmd = &cobra.Command{
 			Args:        cmdArgs,
 			Detach:      runDetach,
 			Volumes:     specs,
+			Env:         envs,
 		}
 
 		if err := container.Run(opts); err != nil {
@@ -108,11 +122,13 @@ var runCmd = &cobra.Command{
 
 func init() {
 	f := runCmd.Flags()
+	f.SetInterspersed(false)
 	f.IntVarP(&runMemMB, "memory", "m", 0, "memory limit in MB (0 = no limit)")
 	f.IntVar(&runCPUPct, "cpu", 0, "cpu limit as percent (0 = no limit)")
 	f.IntVar(&runPidsMax, "pids", 0, "max processes (0 = no limit)")
 	f.BoolVarP(&runDetach, "detach", "d", false, "run container in background")
 	f.StringArrayVarP(&runVolumes, "volume", "v", nil, "volume mount (repeatable): src:dst[:ro]")
+	f.StringArrayVarP(&runEnv, "env", "e", nil, "environment variable (repeatable): KEY=VAL or KEY")
 }
 
 func generateID() string {

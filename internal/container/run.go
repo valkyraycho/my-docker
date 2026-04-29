@@ -25,6 +25,7 @@ type RunOptions struct {
 	Args        []string
 	Detach      bool
 	Volumes     []*volume.Spec
+	Env         []string
 }
 
 func Run(opts RunOptions) error {
@@ -78,6 +79,8 @@ func Run(opts RunOptions) error {
 	cmd.ExtraFiles = []*os.File{pipeR}
 
 	defer pipeW.Close()
+
+	cmd.Env = append(os.Environ(), opts.Env...)
 
 	if err := cmd.Start(); err != nil {
 		pipeR.Close()
