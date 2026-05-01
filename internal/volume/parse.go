@@ -1,6 +1,8 @@
 package volume
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -21,6 +23,12 @@ type Spec struct {
 }
 
 func Parse(s string) (*Spec, error) {
+	if !strings.Contains(s, ":") {
+		if !strings.HasPrefix(s, "/") {
+			return nil, fmt.Errorf("volume spec %q: expected src:dst[:mode] or /container/path", s)
+		}
+		return &Spec{Kind: Named, Source: generateAnonymousName(), Target: s, ReadOnly: false}, nil
+	}
 	parts := strings.Split(s, ":")
 	if len(parts) != 2 && len(parts) != 3 {
 		return nil, fmt.Errorf("invalid volume spec %q: expected src:dst[:mode]", s)
@@ -61,4 +69,10 @@ func Parse(s string) (*Spec, error) {
 	}
 
 	return &Spec{Kind: kind, Source: source, Target: target, ReadOnly: readOnly}, nil
+}
+
+func generateAnonymousName() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return "anon_" + hex.EncodeToString(b)
 }
