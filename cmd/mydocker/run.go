@@ -14,6 +14,7 @@ import (
 	"github.com/valkyraycho/my-docker/internal/cgroup"
 	"github.com/valkyraycho/my-docker/internal/container"
 	"github.com/valkyraycho/my-docker/internal/image"
+	"github.com/valkyraycho/my-docker/internal/network"
 	"github.com/valkyraycho/my-docker/internal/overlay"
 	"github.com/valkyraycho/my-docker/internal/registry"
 	"github.com/valkyraycho/my-docker/internal/volume"
@@ -26,6 +27,7 @@ var (
 	runDetach  bool
 	runVolumes []string
 	runEnv     []string
+	runPorts   []string
 )
 
 var runCmd = &cobra.Command{
@@ -97,6 +99,15 @@ var runCmd = &cobra.Command{
 			}
 		}
 
+		var ports []*network.PortSpec
+		for _, s := range runPorts {
+			spec, err := network.ParsePortSpec(s)
+			if err != nil {
+				return fmt.Errorf("port: %w", err)
+			}
+			ports = append(ports, spec)
+		}
+
 		opts := container.RunOptions{
 			ContainerID: containerID,
 			Image:       ref,
@@ -107,6 +118,7 @@ var runCmd = &cobra.Command{
 			Detach:      runDetach,
 			Volumes:     specs,
 			Env:         envs,
+			Ports:       ports,
 		}
 
 		if err := container.Run(opts); err != nil {
@@ -129,6 +141,7 @@ func init() {
 	f.BoolVarP(&runDetach, "detach", "d", false, "run container in background")
 	f.StringArrayVarP(&runVolumes, "volume", "v", nil, "volume mount (repeatable): src:dst[:ro]")
 	f.StringArrayVarP(&runEnv, "env", "e", nil, "environment variable (repeatable): KEY=VAL or KEY")
+	f.StringArrayVarP(&runPorts, "publish", "p", nil, "publish port (repeatable): hostPort:containerPort")
 }
 
 func generateID() string {

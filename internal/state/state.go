@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/valkyraycho/my-docker/internal/network"
 	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
@@ -40,6 +41,8 @@ type Container struct {
 	IP string `json:"ip,omitempty"`
 
 	Volumes []*volume.Spec `json:"volumes,omitempty"`
+
+	Ports []*network.PortSpec `json:"ports,omitempty"`
 }
 
 func (c *Container) Save() error {

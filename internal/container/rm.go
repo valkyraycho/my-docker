@@ -48,7 +48,7 @@ func Rm(prefix string, force bool) error {
 		errs = append(errs, fmt.Errorf("remove container state directory: %w", err))
 	}
 
-	if err := network.Teardown(c.ID); err != nil {
+	if err := network.Teardown(c.ID, c.Ports, c.IP); err != nil {
 		errs = append(errs, fmt.Errorf("teardown network: %w", err))
 	}
 

@@ -12,6 +12,11 @@ import (
 
 const bridgeName = "mydocker0"
 
+func enableRouteLocalnet() error {
+	return run("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.route_localnet=1",
+		bridgeName))
+}
+
 func EnsureBridge() error {
 	if !bridgeExists() {
 		if err := createBridge(); err != nil {
@@ -28,6 +33,9 @@ func EnsureBridge() error {
 	}
 	if err := enableIPForwarding(); err != nil {
 		return fmt.Errorf("enable ip forwarding: %w", err)
+	}
+	if err := enableRouteLocalnet(); err != nil { // ← ADD THIS
+		return fmt.Errorf("enable route_localnet: %w", err)
 	}
 
 	return nil

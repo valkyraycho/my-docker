@@ -26,6 +26,7 @@ type RunOptions struct {
 	Detach      bool
 	Volumes     []*volume.Spec
 	Env         []string
+	Ports       []*network.PortSpec
 }
 
 func Run(opts RunOptions) error {
@@ -102,7 +103,7 @@ func Run(opts RunOptions) error {
 		return fmt.Errorf("read start time: %w", err)
 	}
 
-	ip, err := network.Setup(opts.ContainerID, opts.Rootfs, cmd.Process.Pid)
+	ip, err := network.Setup(opts.ContainerID, opts.Rootfs, cmd.Process.Pid, opts.Ports)
 	if err != nil {
 		cmd.Process.Kill()
 		cg.Destroy()
@@ -123,18 +124,19 @@ func Run(opts RunOptions) error {
 		StartedAt: now,
 		IP:        ip,
 		Volumes:   opts.Volumes,
+		Ports:     opts.Ports,
 	}
 	if err := c.Save(); err != nil {
 		cmd.Process.Kill()
 		cg.Destroy()
-		network.Teardown(opts.ContainerID)
+		network.Teardown(opts.ContainerID, opts.Ports, ip)
 		return fmt.Errorf("save state: %w", err)
 	}
 
 	if err := pipeW.Close(); err != nil {
 		cmd.Process.Kill()
 		cg.Destroy()
-		network.Teardown(opts.ContainerID)
+		network.Teardown(opts.ContainerID, opts.Ports, ip)
 		return fmt.Errorf("signal child: %w", err)
 	}
 
@@ -142,7 +144,7 @@ func Run(opts RunOptions) error {
 		return nil
 	}
 	defer cg.Destroy()
-	defer network.Teardown(opts.ContainerID)
+	defer network.Teardown(opts.ContainerID, opts.Ports, ip)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, unix.SIGINT, unix.SIGTERM)
