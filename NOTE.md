@@ -1943,6 +1943,426 @@ The three big ideas tying it together:
 
 ---
 
+## Milestone 10 — CLI polish + env vars + port publishing + anonymous volumes + inspect
+
+M10 is the "make it usable" milestone. Five changes, each small on its own; together they turn a working-but-raw runtime into something shaped like the `docker` you use every day. One of them — **port publishing** — required a multi-round debugging session that taught deep Linux networking. We'll walk through that in detail because the bugs are the kind you'll meet again, in other systems, and recognize immediately.
+
+### What shipped
+
+```
+cmd/mydocker/
+├── main.go        → cobra root; owns exit-code propagation
+├── run.go         → runCmd (all the flags)
+├── pull.go pullCmd      ps.go psCmd          logs.go logsCmd
+├── stop.go stopCmd      rm.go rmCmd          inspect.go inspectCmd  (NEW)
+└── init.go        → initCmd (Hidden + DisableFlagParsing)
+
+internal/network/ports.go                 (NEW: ParsePortSpec, PublishPorts, UnpublishPorts)
+internal/network/nat.go  + bridge.go     (UPDATED: hairpin MASQUERADE, route_localnet sysctl)
+internal/volume/parse.go                  (UPDATED: anonymous volume branch)
+internal/state/state.go                   (UPDATED: +IP, +Ports)
+internal/container/run.go  + rm.go       (UPDATED: env, ports, teardown signatures)
+```
+
+### User-visible additions
+
+```bash
+mydocker --help                         # cobra-generated
+mydocker run -e KEY=VAL ...             # explicit env var
+mydocker run -e KEY ...                 # inherit KEY from host env
+mydocker run -p 8080:80 ...             # publish TCP port
+mydocker run -v /container/only/path    # anonymous volume (named with random suffix)
+mydocker inspect <id>                   # full state JSON
+```
+
+---
+
+### 10a · Migrating to cobra — why it actually matters
+
+The old dispatch was:
+
+```go
+switch os.Args[1] {
+case "run":   runCommand(os.Args[2:])
+case "pull":  pullCommand(os.Args[2:])
+// ... etc
+}
+```
+
+Every command lived in `main.go`. Adding `inspect` would have meant editing `main.go` (grow the switch), adding another `Command` function beside all the others, and hand-rolling `--help`. Not fatal, but the file would keep growing.
+
+Cobra flips the shape. One command, one file:
+
+```go
+// cmd/mydocker/inspect.go — the entire new command, 20 lines
+var inspectCmd = &cobra.Command{
+    Use:   "inspect <id>",
+    Short: "Display detailed information about a container",
+    Args:  cobra.ExactArgs(1),
+    RunE: func(cmd *cobra.Command, args []string) error {
+        c, err := state.Find(args[0])
+        if err != nil { return err }
+        b, _ := json.MarshalIndent(c, "", "  ")
+        fmt.Fprintln(os.Stdout, string(b))
+        return nil
+    },
+}
+```
+
+And `main.go` becomes a three-line registration + an error-handling harness:
+
+```go
+// cmd/mydocker/main.go
+rootCmd.AddCommand(runCmd, initCmd, pullCmd, psCmd, logsCmd, stopCmd, rmCmd, inspectCmd)
+
+for _, c := range rootCmd.Commands() {
+    c.SilenceErrors = true    // main owns all printing
+}
+
+err := rootCmd.Execute()
+if err == nil { return }
+
+var ee *exec.ExitError
+if errors.As(err, &ee) {
+    os.Exit(ee.ExitCode())   // container exit code propagates
+}
+fmt.Fprintln(os.Stderr, "Error:", err)
+os.Exit(1)
+```
+
+`★ Insight ─────────────────────────────────────`
+**Four cobra idioms worth internalizing, because they generalize to every cobra CLI you'll ever write:**
+
+1. **`RunE` returning `error`, `main` owning `os.Exit`.** Commands never call `os.Exit` themselves — they return errors up. `main()` decides policy (print + exit code). This is *exactly* the same separation as `http.Handler` (return result, let the server write it) or `testing.T` (return pass/fail, let the framework print). It's a pattern that shows up everywhere.
+2. **`SilenceUsage: true` on the root + `SilenceErrors: true` on each child.** Cobra's default behavior is to print usage on every error (because the user "clearly made a flag mistake") and also print the error. For a real CLI that's *horrible* — you type `mydocker run foo bar` with a typo and get a wall of help text mixed with your error. These two flags kill both defaults; `main()` prints errors deliberately.
+3. **`DisableFlagParsing: true` on `init`.** The internal `init` subcommand takes `rootfs cmd arg1 arg2 ...` and the args may legitimately include things like `-e` that cobra would try to parse as flags. Disabling parsing hands the whole tail to `RunE` as raw `args`. Pair with `Hidden: true` so it doesn't show in `--help`.
+4. **`f.SetInterspersed(false)` on `run`.** This is the most important flag-handling decision in the file. Without it, `mydocker run alpine:3.19 sh -c 'echo $FOO'` parses `-c` as a flag to `mydocker`, not to `sh`. Turning interspersing off means: "once you see the first positional (`alpine:3.19`), everything after is positional." Users tripped over this exact issue in the migration, with the error `unknown shorthand flag: 'c' in -c`.
+`─────────────────────────────────────────────────`
+
+There's one other structural change worth noting. `stringSliceFlag` from M8 is gone — cobra's `StringArrayVarP` replaces it:
+
+```go
+f.StringArrayVarP(&runVolumes, "volume", "v", nil, "...")   // repeatable, accumulates values
+f.StringArrayVarP(&runEnv,     "env",    "e", nil, "...")
+f.StringArrayVarP(&runPorts,   "publish","p", nil, "...")
+```
+
+Three repeatable flags, three lines, uniform shape. The old hand-rolled `flag.Value` implementation worked but is obsolete now.
+
+---
+
+### 10b · Environment variables — two-form parser in 6 lines
+
+```go
+// cmd/mydocker/run.go
+for _, e := range runEnv {
+    if strings.Contains(e, "=") {
+        envs = append(envs, e)                       // -e FOO=bar → "FOO=bar"
+    } else {
+        if val, ok := os.LookupEnv(e); ok {
+            envs = append(envs, e+"="+val)            // -e FOO → read from host, inject "FOO=<host value>"
+        }
+        // missing-from-host: silently skipped (matches docker's behavior)
+    }
+}
+```
+
+And the injection in `run.go`:
+
+```go
+// internal/container/run.go
+cmd.Env = append(os.Environ(), opts.Env...)
+```
+
+This is a design choice worth naming: `cmd.Env` starts with the *entire host environment* and appends our opts on top. `-e` values win on duplicate keys (Go's `exec.Command` respects last-write-wins in the env slice). Docker, by contrast, gives containers a minimal default environment (`PATH`, `HOSTNAME`, `HOME`). We inherit everything.
+
+**Consequence:** if your shell exports `AWS_SECRET_ACCESS_KEY`, every container you run sees it. For a learning tool that's fine; for production it'd be a leak. One of the small things a real daemon (M9) would clean up.
+
+**Flow end-to-end:** host shell → `mydocker` CLI → spawns `init` with `cmd.Env = host + opts.Env` → `init` runs user workload with `cmd.Env = os.Environ()` (inherits its own) → workload sees the whole merged set. Three processes deep, env flows through.
+
+---
+
+### 10c · Port publishing — and the three bugs we caught along the way
+
+This is the hardest piece of M10 and the most educational. The surface feature is `-p 8080:80` — publish container port 80 on host port 8080. The mechanism is two iptables DNAT rules. But getting it to actually deliver a packet to the container took three iterations of debugging, each one teaching a different Linux-networking concept.
+
+#### The design — two chains, two destinations
+
+```go
+// internal/network/ports.go — iptablesRule
+args := []string{"-t", "nat", action, chain,
+    "-p", spec.Protocol,
+    "--dport", strconv.Itoa(spec.HostPort)}
+if outLoopback {
+    args = append(args, "-o", "lo")
+}
+args = append(args, "-j", "DNAT", "--to-destination",
+    fmt.Sprintf("%s:%d", containerIP, spec.ContainerPort))
+```
+
+`PublishPorts` installs **two** rules per port:
+
+| Chain | Matches packets from | Why |
+|---|---|---|
+| **PREROUTING** | External machines arriving on `eth0` (or whatever) | Packet enters from outside → DNAT rewrites dst before routing → routed to container |
+| **OUTPUT** | Host's own processes hitting `localhost:8080` | Locally-originated packets never hit PREROUTING; they hit OUTPUT. Need a separate rule. |
+
+Both rewrite the destination from `:8080` to `<containerIP>:80`. The `-o lo` qualifier on the OUTPUT rule scopes it to loopback-destined traffic only — we don't want to mangle every outbound packet from every host process.
+
+```go
+// internal/network/ports.go — PublishPorts with unwind-on-partial-failure
+var installed []*PortSpec
+for _, spec := range specs {
+    runIPTablesAppend("PREROUTING", containerIP, spec, false)
+    runIPTablesAppend("OUTPUT",     containerIP, spec, true)   // outLoopback=true
+    installed = append(installed, spec)
+}
+```
+
+Same unwind pattern you've seen in M5/M7/M8 — keep a list, walk it back on failure.
+
+#### The debugging journey — what we actually hit
+
+The initial test went like this:
+
+```bash
+# Start a container publishing a port, with a sleep keeping it alive
+mydocker run -d -p 8080:80 alpine:3.19 sleep 300
+
+# Curl it from the host
+curl -v http://localhost:8080/
+```
+
+We expected "Connection refused" (packet reaches container, nobody listening on port 80, TCP RST sent back — success for our purposes, proving end-to-end delivery). What we got was a **hang**. The iptables counter in PREROUTING/OUTPUT showed our DNAT rule was matching (counter > 0), but curl timed out.
+
+**Hang vs refused is a crucial diagnostic distinction**: refused means the packet got there and came back. Hang means the packet got *eaten* somewhere silently — either going or coming back. That shifted us into a different failure mode.
+
+---
+
+#### Bug #1: the martian packet — `route_localnet=0`
+
+Trace what happens to `curl localhost:8080` on the host, step by step:
+
+```
+1. curl creates TCP packet:  src=127.0.0.1, dst=127.0.0.1:8080
+2. Kernel routes it:          dst=127.0.0.1 → outgoing interface = lo
+3. OUTPUT chain (nat) fires:  our DNAT rule matches, rewrites dst to 172.42.0.2:80
+4. Kernel re-evaluates route: dst=172.42.0.2 → outgoing interface = mydocker0
+5. Packet now has:            src=127.0.0.1, dst=172.42.0.2, outgoing = mydocker0
+6. Kernel's martian filter:   "127.0.0.1 source on mydocker0? That's suspicious."
+   → DROPS the packet
+```
+
+A **martian** is a packet whose source IP is impossible for the interface it's traversing. `127.0.0.0/8` is reserved for `lo`; seeing it on any other interface is classically a spoofing attempt, so the kernel drops it by default. That's a security feature going back decades.
+
+For DNAT'd loopback traffic to reach the container, we need the kernel's explicit permission to treat `127.0.0.1` as a legitimate source on `mydocker0`. That permission is a per-interface sysctl:
+
+```go
+// internal/network/bridge.go — the fix
+func enableRouteLocalnet() error {
+    return run("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.route_localnet=1",
+        bridgeName))
+}
+```
+
+Called from `EnsureBridge`, after the bridge is up (the sysctl only exists once the interface does).
+
+`★ Insight ─────────────────────────────────────`
+**This is the exact problem real Docker solved in its early port-publishing work.** If you `cat /proc/sys/net/ipv4/conf/docker0/route_localnet` on any host with Docker, it reads `1`. Docker sets it automatically on its bridge. Reading their source once, it's one function call you'd easily miss. We rediscovered it by hitting the same wall.
+
+**Broader lesson:** when your iptables rule counter bumps but the packet doesn't arrive, the kernel's netfilter hooks are firing but something *past netfilter* is dropping it. Candidates are: routing-stack drops (martian, rp_filter, no route), conntrack misconfiguration, or FORWARD policy. Count your counters in every chain along the path — the hop where the counter *doesn't* bump is where the packet died.
+`─────────────────────────────────────────────────`
+
+---
+
+#### Bug #2: per-namespace `127.0.0.1` — the hairpin problem
+
+We added `route_localnet=1`, re-ran curl — and it **still hung**. The martian filter now permitted the packet to leave the host, but something *else* was eating it. Time to think harder.
+
+The key realization: `127.0.0.1` is a **per-network-namespace** address. Every netns has its own loopback, its own `127.0.0.1`. The host's `127.0.0.1` and the container's `127.0.0.1` are literally different interfaces that happen to share a name — like "room 5" in two different hotels.
+
+Trace the packet again, this time from the container's view:
+
+```
+Container receives:  src=127.0.0.1, dst=172.42.0.2:80
+Container processes it (or in our test, has nothing listening, sends RST)
+Container's kernel responds:  src=172.42.0.2:80, dst=127.0.0.1
+Container's kernel routes:    dst=127.0.0.1 → outgoing interface = lo  (container's OWN lo!)
+Reply never leaves the container.
+```
+
+The reply went to the container's own loopback interface and died there. It never came back out via `eth0` → bridge → host. The host's curl waited forever.
+
+**The fix: hairpin SNAT.** We rewrite the source IP of the DNAT'd packet to something routable from the container's namespace — the bridge's IP (`172.42.0.1`). When the container sees `src=172.42.0.1`, it replies to the bridge's IP, which routes via its default gateway (which *is* the bridge), back out through `eth0`, back to the host.
+
+```go
+// internal/network/nat.go — EnsureNAT (post-fix)
+// Rule 1 (always existed, from M7): masquerade OUTBOUND container traffic to the internet
+run("iptables", "-t", "nat", "-A", "POSTROUTING",
+    "-s", subnet, "!", "-o", bridgeName, "-j", "MASQUERADE")
+
+// Rule 2 (M10 fix): hairpin — masquerade INBOUND-via-DNAT packets going INTO the bridge
+ensureRule("POSTROUTING",
+    "-o", bridgeName, "!", "-s", subnet, "-j", "MASQUERADE")
+```
+
+Reading the new rule piece by piece:
+- `-o mydocker0` — **leaving** via our bridge (so it's about to enter the container)
+- `! -s 172.42.0.0/24` — NOT sourced from within the container subnet (we don't want to touch container-to-container traffic)
+- `-j MASQUERADE` — rewrite source to the outgoing interface's IP — `172.42.0.1`, the bridge's IP
+
+Net effect: host-originated packets (`src=127.0.0.1` or `src=192.168.x.x`, whatever) get their source rewritten to `172.42.0.1` as they enter the bridge. The container sees `src=172.42.0.1`, replies to `172.42.0.1`, reply routes out naturally. Conntrack reverses everything on the way back (undoing both the DNAT and the SNAT), and curl receives a normal "Connection refused."
+
+```
+Host netns                                   Container netns
+──────────────────────────                   ────────────────────
+curl: src=127.0.0.1, dst=127.0.0.1:8080
+
+  OUTPUT (nat) DNAT
+   → dst=172.42.0.2:80
+
+  POSTROUTING (nat) MASQUERADE ← NEW M10 RULE
+   → src=172.42.0.1
+
+  packet on mydocker0: src=172.42.0.1, dst=172.42.0.2:80 ─────►  receives packet
+                                                                 sends RST:
+                                                                   src=172.42.0.2:80,
+                                                                   dst=172.42.0.1
+                                                               ◄───── packet on eth0
+
+  conntrack un-rewrites:
+    SNAT reversed: dst=172.42.0.1 → dst=127.0.0.1
+    DNAT reversed: src=172.42.0.2:80 → src=127.0.0.1:8080
+  curl sees: "Connection refused from 127.0.0.1:8080" — as expected.
+```
+
+**Bonus discovery:** hairpin MASQUERADE *also* fixes the martian problem, because the source IP gets rewritten to `172.42.0.1` *before* the packet leaves via `mydocker0`. The packet is no longer a martian at that point. In principle we could drop `route_localnet=1`, but we kept it as defense-in-depth — two fixes for the same class of bug is cheap insurance.
+
+---
+
+#### Bug #3 (the red herring): alpine's minimal busybox
+
+Before we got to the real bugs, we spent two rounds trying to run a server inside the container as a target for curl. `busybox httpd` failed with "applet not found" — alpine's default busybox doesn't include `httpd` (it's in `busybox-extras`, which isn't pre-installed).
+
+The moral is smaller but useful: **stop testing the thing you haven't changed.** Port publishing is a network-layer concern. We don't need a server to prove the network path; `sleep 300` + "expect Connection refused" is strictly better as a test because it isolates the network layer from the application layer. "Connection refused" proves the packet reached the container and its kernel replied — no dependency on what's installed in the image. Once we switched to that test, we immediately caught the real hang-vs-refused signal.
+
+`★ Insight ─────────────────────────────────────`
+**Diagnostic tests should minimize their surface area.** If you're testing port forwarding, use the simplest possible workload inside the container. If you're testing file mounts, use `cat`. If you're testing DNS, use `nslookup`. Every extra dependency you add to a test ("let's install httpd and serve a file") is an extra place where failure can hide the actual signal you care about. The inverse corollary: when a test fails in an unexpected way, ask whether the failure is in the thing you built or in the test harness you wrapped around it. Two rounds of "httpd: applet not found" was all test-harness noise.
+`─────────────────────────────────────────────────`
+
+---
+
+#### `Teardown` signature change
+
+Unpublishing ports requires knowing the container's IP (it's in the DNAT rule's `--to-destination`), so `Teardown` grew two arguments:
+
+```go
+// internal/network/setup.go
+func Teardown(containerID string, ports []*PortSpec, ip string) error {
+    UnpublishPorts(ip, ports)
+    RemoveVeth(containerID)
+    ReleaseIP(containerID)
+    // errors.Join the lot
+}
+```
+
+And `rm.go` reads them back from the persisted state:
+
+```go
+// internal/container/rm.go
+network.Teardown(c.ID, c.Ports, c.IP)
+```
+
+This is exactly why `Container.Ports` and `Container.IP` had to be persisted — without them, we'd have no way to know which iptables rules to remove at `rm` time. Same mechanical reason as M8's `c.Volumes` persistence.
+
+---
+
+### 10d · Anonymous volumes — one line of Parse, big UX win
+
+M8 parsed `src:dst[:mode]`. Users said "I want persistence but I don't care about naming." So we added a third shape: just `/container/path`.
+
+```go
+// internal/volume/parse.go
+func Parse(s string) (*Spec, error) {
+    if !strings.Contains(s, ":") {
+        if !strings.HasPrefix(s, "/") {
+            return nil, fmt.Errorf("volume spec %q: expected src:dst[:mode] or /container/path", s)
+        }
+        return &Spec{
+            Kind:   Named,
+            Source: generateAnonymousName(),   // "anon_" + random 8 bytes
+            Target: s,
+            ReadOnly: false,
+        }, nil
+    }
+    // ... existing src:dst[:mode] path unchanged ...
+}
+
+func generateAnonymousName() string {
+    b := make([]byte, 8)
+    _, _ = rand.Read(b)
+    return "anon_" + hex.EncodeToString(b)
+}
+```
+
+Usage:
+
+```bash
+mydocker run -v /var/lib/postgres alpine:3.19 sh
+# creates /var/lib/mydocker/volumes/anon_deadbeefcafebabe/_data/ under the hood
+# mounts it at /var/lib/postgres inside the container
+```
+
+**Why `anon_` prefix?** Named volumes can't contain slashes, and we wanted a reserved prefix that never clashes with user names. `anon_` is recognizable in `ls /var/lib/mydocker/volumes/` and hints at lifecycle — these are safe to prune.
+
+The rest of the code didn't change. Once a `Spec` exists, the machinery in M8 handles it identically to an explicit named volume. This is the kind of small addition that comes *cheap* when the underlying abstraction is well-shaped, and comes *expensive* when it isn't. We got lucky — our M8 `Kind Bind|Named` enum already covered "named volume that I happen to have generated."
+
+---
+
+### 10e · `inspect` — the payoff for persisting state well
+
+```go
+// cmd/mydocker/inspect.go — the entire command
+var inspectCmd = &cobra.Command{
+    Use:  "inspect <id>",
+    Short: "Display detailed information about a container",
+    Args:  cobra.ExactArgs(1),
+    RunE: func(cmd *cobra.Command, args []string) error {
+        c, err := state.Find(args[0])
+        if err != nil { return err }
+        b, _ := json.MarshalIndent(c, "", "  ")
+        fmt.Fprintln(os.Stdout, string(b))
+        return nil
+    },
+}
+```
+
+Four effective lines. Load the state, marshal as indented JSON, print.
+
+This is a victory lap for M6's design. We persisted everything the lifecycle commands needed. `inspect` is just exposing that persistence. Every field that shows up (`id`, `image`, `layers`, `pid`, `start_time`, `status`, `exit_code`, `created_at`/`started_at`/`finished_at`, `ip`, `volumes`, `ports`) was added one milestone at a time. None of them required changes here.
+
+> **Design principle this makes tangible:** persist more than you think you need. Data you recorded but never read is cheap; data you needed but didn't record is expensive. `inspect` is the "didn't know I'd want this someday" command that tells you whether your past-self made the right call.
+
+---
+
+### M10 summary — what each piece ships
+
+| Piece | File(s) | What you type | What happens |
+|---|---|---|---|
+| Cobra migration | `cmd/mydocker/*.go` | `mydocker --help` | Standard CLI shape, command-per-file, `RunE → error → main` error flow |
+| Environment vars | `run.go` in container + cmd | `-e FOO=bar`, `-e FOO` | `cmd.Env = append(os.Environ(), opts.Env...)` injects KEYs |
+| Port publishing | `network/ports.go`, `nat.go`, `bridge.go` | `-p 8080:80` | PREROUTING + OUTPUT DNAT rules + hairpin MASQUERADE + route_localnet |
+| Anonymous volumes | `volume/parse.go` | `-v /container/path` | Auto-generated `anon_xxx` named volume |
+| `inspect` | `cmd/mydocker/inspect.go` | `mydocker inspect <id>` | Marshal state as JSON |
+
+**Three enduring ideas from M10:**
+
+1. **Debugging network drops by counter-walk.** When a packet goes missing, check the counter on every iptables chain it *should* traverse. The first chain whose counter doesn't increment is where the packet died. This single technique would have caught route_localnet martian drops in minutes if we'd known to look.
+2. **Per-namespace addresses are their own failure mode.** `127.0.0.1` inside a container is not the host's `127.0.0.1`. This intuition extends: `lo` is per-ns, routing tables are per-ns, iptables rules are per-ns. Thinking "same IP string = same thing" is the source of an entire class of container-networking bugs.
+3. **Cobra's command-per-file + `RunE` + `SilenceErrors` is the scalable shape for Go CLIs.** Once you learn it, every new subcommand is a 10-line file; every error path is `main()`'s responsibility; every `--help` is free. The migration paid for itself inside M10 alone — `inspect` was a fifteen-line drop-in.
+
+---
+
 ## Putting it all together — commands across milestones
 
 ### `mydocker pull alpine:3.19`
@@ -1971,19 +2391,22 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
            ▼
 [parent] overlay.Mount(id, layers)                   ← stacked rootfs → mergedPath
 [parent] cgroup.Create(limits)                       ← mkdir + write memory.max, cpu.max
-[parent] for each -v spec:                           ← [M8] volume mounts
+[parent] for each -v spec:                           ← [M8] volume mounts (+ M10 anonymous form)
            volume.Mount(spec, mergedPath)            ← MS_BIND onto merged (+ MS_REMOUNT|MS_RDONLY if :ro)
+[parent] cmd.Env = append(os.Environ(), opts.Env)    ← [M10] inject -e KEY=VAL into child
 [parent] os.Pipe() → cmd.ExtraFiles = {pipeR}        ← [M7] sync pipe as FD 3 in child
 [parent] exec.Command("/proc/self/exe", "init", ...) ← with CLONE_NEWPID|NEWNS|NEWUTS|NEWIPC|NEWNET
 [parent] cg.AddPID(child.Pid)
 [parent] state.ReadStartTime(child.Pid)              ← record the (PID, StartTime) identity
-[parent] network.Setup(id, rootfs, child.Pid)        ← [M7] bridge+veth+NAT+DNS
+[parent] network.Setup(id, rootfs, child.Pid, ports) ← [M7+M10] bridge+veth+NAT+DNS+ports
            │
-           │   EnsureBridge   → ip link add mydocker0 + IP + up + ip_forward=1
-           │   EnsureNAT      → iptables -A POSTROUTING MASQUERADE
+           │   EnsureBridge   → ip link add mydocker0 + IP + up + ip_forward=1 + [M10] route_localnet=1
+           │   EnsureNAT      → iptables POSTROUTING MASQUERADE (outbound)
+           │                  + [M10] POSTROUTING hairpin MASQUERADE (inbound-via-DNAT)
            │   AllocateIP     → pick first free 172.42.0.N
            │   SetupVeth      → create pair, move peer into child's netns, configure eth0
            │   WriteResolvConf → drop 8.8.8.8/1.1.1.1 into rootfs/etc/resolv.conf
+           │   PublishPorts   → [M10] for each -p: iptables DNAT in PREROUTING + OUTPUT
            ▼
 [parent] Container.Save() (with IP)                  ← state.json, atomic write
 [parent] pipeW.Close()                               ← [M7] EOF on FD 3 — child unblocks
@@ -2001,7 +2424,7 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
              ▼  (user exits / stop / crash)
 [parent] state.Status = "exited", ExitCode, FinishedAt
 [parent] Container.Save()                            ← final state persisted
-[parent] network.Teardown(id)                        ← [M7] remove veth + release IP
+[parent] network.Teardown(id, ports, ip)             ← [M7+M10] unpublish ports, remove veth, release IP
 [parent] overlay.Unmount(id)                         ← tear down merged (state dir stays!)
 [parent] cg.Destroy()
 ```
@@ -2029,18 +2452,26 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
    → state.Find → IsRunning? → SIGTERM → waitForExit(10s) → SIGKILL → reconcileExited
 
 [user] mydocker rm <id>
-   → for spec in c.Volumes: volume.Unmount(spec, MergedPath(id))   ← [M8] first
-   → overlay.Unmount + cgroup.Destroy + state.RemoveDir + network.Teardown (errors.Join)
+   → for spec in c.Volumes: volume.Unmount(spec, MergedPath(id))            ← [M8] first
+   → overlay.Unmount + cgroup.Destroy + state.RemoveDir
+   → network.Teardown(c.ID, c.Ports, c.IP)                                  ← [M7+M10] unpublish ports too
+   (all errors.Join'd)
 ```
 
 ---
 
-## What's next (milestones 9–10)
+## Where we landed
 
-| # | What | Why it's the logical next step |
+The original 10-milestone plan is complete **except for M9 (daemon architecture)**, which we deliberately skipped for M10 — it's a structural overhaul, not a feature, and M10's CLI polish was higher-leverage for a learning project. The deferred work, in rough priority order:
+
+| # | What | Why it's still open |
 |---|------|-------------------------------|
-| 9 | **Daemon architecture** | Split `mydocker` into CLI + daemon with a Unix socket API. Solves M6's state-on-reboot gap *and* M7's stale-IP-allocations gap, because a daemon can reconcile once on startup. Also gives us a natural place to host a `volume ls` / `volume rm` subcommand. |
-| 10 | CLI polish | Cobra, better errors, maybe `logs -f` / `exec` / `inspect` / `ps` with IP + mounts columns / `volume ls` / `volume prune`. |
+| 9 | **Daemon architecture** | Split `mydocker` into CLI + daemon with a Unix socket API. Fixes the cluster of "eventually-consistent" gaps: state survives reboot with daemon-startup reconciliation, stale IP allocations get cleaned up, and the `mydocker run` parent process no longer needs to keep running for detached containers (today it exits after `cmd.Start()`, which is fine but means no one is watching for child death — `ps` has to reconcile lazily). |
+| — | `docker exec` | Running a second command inside an existing container. Implementation-wise: `nsenter` into the target's PID + mount + net namespaces, inherit the same cgroup. A 50-line subcommand on top of what we already have. |
+| — | `docker logs -f` | Follow mode. Currently `logs` just `io.Copy`s to EOF. For `-f` we'd either `inotify` the log file or poll. |
+| — | `volume ls` / `volume prune` | List everything under `/var/lib/mydocker/volumes/`, prune anything not referenced by a live container's state. |
+| — | UDP port publishing | One-line change: parse `8080:80/udp` and set `Protocol: "udp"` in the iptables rules. Our `PortSpec.Protocol` field already exists. |
+| — | `ps` with IP + PORTS columns | Data's already in `state.Container`; just needs display code. |
 
 ---
 
@@ -2077,3 +2508,13 @@ mydocker run --memory 64 --cpu 50 alpine:3.19 /bin/sh
 - `Spec` is persisted to `state.json` via `json.Marshal`. `Kind` is an `int` enum (`Bind = 0`, `Named = 1`). What happens if you later reorder the enum constants — say, add `Tmpfs` at position 0, pushing `Bind` to 1? What does this tell you about serializing enums?
 - If the same source path is bind-mounted into two containers simultaneously (say `-v /var/log:/logs` in both), what coordination exists between them? What happens if one container's process writes a file while the other is reading it? (There's no mydocker-specific answer here — the question is purely about Linux bind mount semantics.)
 - Named volume directories under `/var/lib/mydocker/volumes/` are never cleaned up — even after the last container that used them is `rm`'d. Compare this to how containers/blobs work. What *should* the policy be, and what command would the user run to trigger it? (Hint: `docker volume prune`.)
+
+### New to M10
+- Walk through the *complete* packet path for `curl http://localhost:8080 → container:80`. Name every chain (at minimum: OUTPUT-nat, POSTROUTING-nat, FORWARD-filter, and the reverse path with conntrack un-rewriting) and which rule of ours fires at each one. If any of the three fixes (route_localnet=1, hairpin MASQUERADE, the OUTPUT DNAT chain) were missing, which specific hop would drop the packet?
+- We install *two* DNAT rules per port (PREROUTING + OUTPUT). Why isn't PREROUTING enough? What class of traffic does it miss, and why does that class not hit PREROUTING? (Hint: think about where the packet enters the kernel — from an interface, or from a local process?)
+- The hairpin MASQUERADE rule uses `! -s 172.42.0.0/24` to exclude container-sourced traffic from being masqueraded on entry to the bridge. What specifically would break if we removed that exclusion — container A curling container B directly, say?
+- `PublishPorts` fails if the host port is already in use — but `iptables -A` doesn't check for that. Where does the conflict actually manifest: at rule-install time, at first-packet time, or somewhere else? And how would you build a proper "port already in use" check into the CLI path before `iptables -A`?
+- Our `cmd.Env = append(os.Environ(), opts.Env...)` leaks *everything* from the parent shell into the container, including secrets. Write the minimum fix to pass only `PATH`, `HOME`, `HOSTNAME`, and explicitly-listed `-e` values. What's the UX trade-off — what will break that "just worked" before?
+- `SetInterspersed(false)` on `run` means `mydocker run alpine:3.19 sh -c 'echo hi' -e FOO=bar` passes `-e FOO=bar` to `sh`, not to `mydocker`. That's what we want for the `-c` case. But now how does a user express `mydocker run -e FOO=bar alpine:3.19 sh`? (Answer: flags before the image ref.) Is that intuition robust? Try `mydocker run alpine:3.19 -e FOO=bar sh` in your head — what does it do?
+- When a detached container exits on its own (the supervisor-process case), nothing updates its `state.json` until the *next* `ps` or `stop`/`rm`. If you then `inspect <id>`, what does it show — and is that accurate? Who'd be responsible for making it accurate in real time? (The answer points directly at why M9's daemon matters.)
+- `inspect` dumps the raw `Container` struct as JSON, including fields like `pid` and `start_time`. Those are correct while the container is running but meaningless after exit (PID may have been reused). Should `inspect` hide them after exit, or is "display raw truth" the better policy? Compare to what `docker inspect` does.
