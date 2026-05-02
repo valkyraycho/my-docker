@@ -18,7 +18,7 @@ var rootCmd = &cobra.Command{
 }
 
 func main() {
-	rootCmd.AddCommand(runCmd, initCmd, pullCmd, psCmd, logsCmd, stopCmd, rmCmd, inspectCmd)
+	rootCmd.AddCommand(runCmd, initCmd, pullCmd, psCmd, logsCmd, stopCmd, rmCmd, inspectCmd, versionCmd)
 
 	// Let main() own all error printing. Each subcommand silences cobra's
 	// default printer so we avoid double-reporting (especially for run,
