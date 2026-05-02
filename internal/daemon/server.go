@@ -16,10 +16,9 @@ type Server struct {
 }
 
 func New(socketPath string) *Server {
-	mux := http.NewServeMux()
 	return &Server{
 		socketPath: socketPath,
-		httpServer: &http.Server{Handler: mux},
+		httpServer: &http.Server{Handler: NewHandler()},
 	}
 }
 
