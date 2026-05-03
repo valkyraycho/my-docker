@@ -38,65 +38,68 @@ func (panicResolver) Resolve(string) ([]string, error) {
 	panic("Resolve should not be called")
 }
 
-// panicStartInit is the default stub plugged into Deps.StartInit when
-// a test passes nil. If a test accidentally triggers the start path
-// without configuring behavior, this surfaces a clear message instead
-// of a confusing nil-func panic deep inside http handling.
+// Panic stubs plugged into each Deps function field when a test leaves
+// that field nil. If a test accidentally triggers a path it didn't
+// configure, the panic message identifies which piece — far more
+// useful than a nil-func call panic deep inside the HTTP layer.
 func panicStartInit(*state.Container) error {
 	panic("StartInit not configured for this test")
 }
+func panicStopInit(*state.Container, time.Duration) error {
+	panic("StopInit not configured for this test")
+}
+func panicKillInit(*state.Container) error {
+	panic("KillInit not configured for this test")
+}
+func panicRemoveInit(*state.Container) error {
+	panic("RemoveInit not configured for this test")
+}
 
-// newTestDaemon starts a daemon on a tempdir socket with the given
-// ImageResolver + StartInit and a fresh Registry backed by a tempdir.
-// Returns a client pointing at the daemon AND the registry handle so
-// tests can seed or inspect state directly.
+// newTestDaemon starts a daemon on a tempdir socket with the supplied
+// Deps template (minus Registry, which the helper creates). Nil fields
+// in the template are filled in with panic-on-call defaults so tests
+// opt into exactly the paths they exercise.
 //
-// Passing nil for resolver or startInit substitutes a panic-on-call
-// default — explicitly opting out of that path. If a test triggers a
-// path it didn't configure, the panic message identifies which piece.
+// Returns a client and the registry handle — tests seed or inspect
+// state directly via the registry, exercise behavior via the client.
 //
-// Cleanup order (LIFO): daemon shutdown runs first, then state dir
+// Cleanup order (LIFO): daemon shutdown runs first, then state-dir
 // restore. Shutdown writes final state while the override is still
 // active; restoring the dir first would race.
-func newTestDaemon(
-	t *testing.T,
-	resolver daemon.ImageResolver,
-	startInit func(*state.Container) error,
-) (*client.Client, *state.Registry) {
+func newTestDaemon(t *testing.T, template daemon.Deps) (*client.Client, *state.Registry) {
 	t.Helper()
 
-	if resolver == nil {
-		resolver = panicResolver{}
+	if template.ImageStore == nil {
+		template.ImageStore = panicResolver{}
 	}
-	if startInit == nil {
-		startInit = panicStartInit
+	if template.StartInit == nil {
+		template.StartInit = panicStartInit
+	}
+	if template.StopInit == nil {
+		template.StopInit = panicStopInit
+	}
+	if template.KillInit == nil {
+		template.KillInit = panicKillInit
+	}
+	if template.RemoveInit == nil {
+		template.RemoveInit = panicRemoveInit
 	}
 
 	tmp := t.TempDir()
 	socketPath := filepath.Join(tmp, "mydocker.sock")
-
-	// Override containersDir so Registry.Add writes into our tempdir.
-	// Register restore FIRST so it runs LAST (Cleanup is LIFO).
 	t.Cleanup(state.WithTempDir(filepath.Join(tmp, "containers")))
 
 	registry, err := state.NewRegistry()
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
+	template.Registry = registry
 
-	deps := &daemon.Deps{
-		Registry:   registry,
-		ImageStore: resolver,
-		StartInit:  startInit,
-	}
-
-	s := daemon.New(socketPath, daemon.NewHandler(deps))
+	s := daemon.New(socketPath, daemon.NewHandler(&template))
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.Start() }()
 
-	// Register daemon shutdown AFTER state restore so it runs FIRST
-	// (see cleanup-order note on this function).
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -117,14 +120,12 @@ func newTestDaemon(
 	return client.New(socketPath), registry
 }
 
-// TestContainerCreate_Success goes end-to-end through the real HTTP
-// transport: client marshals, daemon parses, resolver returns layers,
-// registry persists, daemon encodes the response. If this passes, the
-// whole create path is working.
+// -------------------- create tests --------------------
+
 func TestContainerCreate_Success(t *testing.T) {
-	c, _ := newTestDaemon(t, &fakeResolver{
-		layers: []string{"/fake/layer1", "/fake/layer2"},
-	}, nil)
+	c, _ := newTestDaemon(t, daemon.Deps{
+		ImageStore: &fakeResolver{layers: []string{"/fake/layer1", "/fake/layer2"}},
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -136,7 +137,6 @@ func TestContainerCreate_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ContainerCreate: %v", err)
 	}
-
 	if resp.ID == "" {
 		t.Error("response ID is empty")
 	}
@@ -144,30 +144,22 @@ func TestContainerCreate_Success(t *testing.T) {
 		t.Errorf("response ID length: got %d (%q), want %d", got, resp.ID, want)
 	}
 	if resp.Warnings == nil {
-		// Wire contract: always emit an array, even if empty.
 		t.Error("response Warnings is nil, want empty slice")
 	}
 }
 
-// TestContainerCreate_ImageNotFound: resolver returns ErrImageNotFound,
-// daemon maps to HTTP 404, client surfaces a non-nil error whose
-// message includes the daemon's status + message. We do a loose
-// substring match rather than an exact compare because the full
-// error string depends on http.Status formatting and the wrapped
-// image error text.
 func TestContainerCreate_ImageNotFound(t *testing.T) {
-	c, _ := newTestDaemon(t, &fakeResolver{err: image.ErrImageNotFound}, nil)
+	c, _ := newTestDaemon(t, daemon.Deps{
+		ImageStore: &fakeResolver{err: image.ErrImageNotFound},
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	_, err := c.ContainerCreate(ctx, &api.ContainerCreateRequest{
-		Image: "does-not-exist",
-	})
+	_, err := c.ContainerCreate(ctx, &api.ContainerCreateRequest{Image: "does-not-exist"})
 	if err == nil {
 		t.Fatal("expected error for missing image, got nil")
 	}
-
 	msg := err.Error()
 	if !strings.Contains(msg, "404") {
 		t.Errorf("error %q: expected 404 status in message", msg)
@@ -177,20 +169,13 @@ func TestContainerCreate_ImageNotFound(t *testing.T) {
 	}
 }
 
-// TestContainerCreate_MissingImageField: request with empty Image
-// should get rejected at the validation step with 400, before the
-// resolver is called. We verify this by using a resolver that would
-// panic if invoked — proving we never reached it.
 func TestContainerCreate_MissingImageField(t *testing.T) {
-	c, _ := newTestDaemon(t, panicResolver{}, nil)
+	c, _ := newTestDaemon(t, daemon.Deps{ImageStore: panicResolver{}})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	_, err := c.ContainerCreate(ctx, &api.ContainerCreateRequest{
-		// Image intentionally omitted.
-		Cmd: []string{"sh"},
-	})
+	_, err := c.ContainerCreate(ctx, &api.ContainerCreateRequest{Cmd: []string{"sh"}})
 	if err == nil {
 		t.Fatal("expected error for empty Image, got nil")
 	}
@@ -199,10 +184,8 @@ func TestContainerCreate_MissingImageField(t *testing.T) {
 	}
 }
 
-// -------------------- container start tests --------------------
+// -------------------- start tests --------------------
 
-// seedCreated inserts a "created" container into the registry for use
-// in start tests. Shared to keep setup noise out of each test body.
 func seedCreated(t *testing.T, reg *state.Registry, id string) {
 	t.Helper()
 	c := &state.Container{
@@ -218,20 +201,18 @@ func seedCreated(t *testing.T, reg *state.Registry, id string) {
 	}
 }
 
-// TestContainerStart_Success: happy path. The fake StartInit pretends
-// to have forked successfully by setting runtime fields on c. After
-// the call, the registry should reflect those fields — proving the
-// handler persisted via Update.
 func TestContainerStart_Success(t *testing.T) {
 	const fakePID = 9999
 
 	startCalled := false
-	c, reg := newTestDaemon(t, nil, func(c *state.Container) error {
-		startCalled = true
-		c.Status = state.StatusRunning
-		c.PID = fakePID
-		c.StartedAt = time.Now()
-		return nil
+	c, reg := newTestDaemon(t, daemon.Deps{
+		StartInit: func(c *state.Container) error {
+			startCalled = true
+			c.Status = state.StatusRunning
+			c.PID = fakePID
+			c.StartedAt = time.Now()
+			return nil
+		},
 	})
 
 	const id = "aabbccddeeff"
@@ -243,12 +224,10 @@ func TestContainerStart_Success(t *testing.T) {
 	if err := c.ContainerStart(ctx, id); err != nil {
 		t.Fatalf("ContainerStart: %v", err)
 	}
-
 	if !startCalled {
 		t.Error("StartInit was never invoked")
 	}
 
-	// Registry should show the mutations the fake made.
 	got, err := reg.Get(id)
 	if err != nil {
 		t.Fatalf("Get after start: %v", err)
@@ -261,11 +240,8 @@ func TestContainerStart_Success(t *testing.T) {
 	}
 }
 
-// TestContainerStart_NotFound: unknown ID gets mapped to 404. StartInit
-// must never be called for a container that doesn't exist; the panic
-// stub surfaces that violation clearly if it regresses.
 func TestContainerStart_NotFound(t *testing.T) {
-	c, _ := newTestDaemon(t, nil, nil) // nil -> panic stubs
+	c, _ := newTestDaemon(t, daemon.Deps{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -279,12 +255,8 @@ func TestContainerStart_NotFound(t *testing.T) {
 	}
 }
 
-// TestContainerStart_AlreadyRunning: daemon returns 304 Not Modified
-// and the client translates that to nil. The StartInit stub would
-// panic if called — proving the 304 short-circuit fires before any
-// attempt to start.
 func TestContainerStart_AlreadyRunning(t *testing.T) {
-	c, reg := newTestDaemon(t, nil, nil) // panic stub — must not be called
+	c, reg := newTestDaemon(t, daemon.Deps{}) // panic stub on StartInit
 
 	const id = "runningone1"
 	running := &state.Container{
@@ -307,13 +279,11 @@ func TestContainerStart_AlreadyRunning(t *testing.T) {
 	}
 }
 
-// TestContainerStart_InitFailure: StartInit returns an error, daemon
-// maps to 500, client surfaces the error with the daemon's message.
-// The registry state should remain "created" — the handler only
-// persists on a successful StartInit.
 func TestContainerStart_InitFailure(t *testing.T) {
-	c, reg := newTestDaemon(t, nil, func(*state.Container) error {
-		return errors.New("simulated kernel failure")
+	c, reg := newTestDaemon(t, daemon.Deps{
+		StartInit: func(*state.Container) error {
+			return errors.New("simulated kernel failure")
+		},
 	})
 
 	const id = "failerone11"
@@ -330,22 +300,18 @@ func TestContainerStart_InitFailure(t *testing.T) {
 		t.Errorf("error %q: expected 500 status in message", err.Error())
 	}
 
-	// Registry should be untouched — Status still "created".
 	got, err := reg.Get(id)
 	if err != nil {
 		t.Fatalf("Get after failed start: %v", err)
 	}
 	if got.Status != state.StatusCreated {
-		t.Errorf("Status after failure: got %q, want %q (handler should not persist)",
+		t.Errorf("Status after failure: got %q, want %q",
 			got.Status, state.StatusCreated)
 	}
 }
 
-// -------------------- container list / inspect tests --------------------
+// -------------------- list / inspect tests --------------------
 
-// seedStatus adds a container with the given status and timestamp.
-// Used to build fixtures that exercise the list endpoint's filter
-// and ordering logic.
 func seedStatus(t *testing.T, reg *state.Registry, id, status string, createdAt time.Time) {
 	t.Helper()
 	c := &state.Container{
@@ -368,12 +334,8 @@ func seedStatus(t *testing.T, reg *state.Registry, id, status string, createdAt 
 	}
 }
 
-// TestContainerList_Empty: no containers -> empty slice, never nil.
-// Important because Go's json.Marshal on a nil slice emits `null`, which
-// would break clients expecting to iterate an array. The daemon's
-// handler explicitly allocates an empty slice to avoid that.
 func TestContainerList_Empty(t *testing.T) {
-	c, _ := newTestDaemon(t, nil, nil)
+	c, _ := newTestDaemon(t, daemon.Deps{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -390,10 +352,8 @@ func TestContainerList_Empty(t *testing.T) {
 	}
 }
 
-// TestContainerList_FiltersRunningOnly: with all=false the endpoint
-// hides non-running containers. Matches `docker ps` default behavior.
 func TestContainerList_FiltersRunningOnly(t *testing.T) {
-	c, reg := newTestDaemon(t, nil, nil)
+	c, reg := newTestDaemon(t, daemon.Deps{})
 
 	now := time.Now()
 	seedStatus(t, reg, "cccccccccccc", state.StatusCreated, now)
@@ -415,10 +375,8 @@ func TestContainerList_FiltersRunningOnly(t *testing.T) {
 	}
 }
 
-// TestContainerList_AllIncludesStopped: with all=true all three
-// statuses come back. Matches `docker ps -a`.
 func TestContainerList_AllIncludesStopped(t *testing.T) {
-	c, reg := newTestDaemon(t, nil, nil)
+	c, reg := newTestDaemon(t, daemon.Deps{})
 
 	now := time.Now()
 	seedStatus(t, reg, "cccccccccccc", state.StatusCreated, now)
@@ -437,15 +395,10 @@ func TestContainerList_AllIncludesStopped(t *testing.T) {
 	}
 }
 
-// TestContainerList_SortedNewestFirst: handler sorts by CreatedAt desc
-// so the most recent container shows up first. Matches Docker's UX
-// where newly-created containers appear at the top of `ps` output.
 func TestContainerList_SortedNewestFirst(t *testing.T) {
-	c, reg := newTestDaemon(t, nil, nil)
+	c, reg := newTestDaemon(t, daemon.Deps{})
 
 	base := time.Now()
-	// Intentionally seed out of chronological order to prove the sort
-	// is doing work, not just preserving insertion order.
 	seedStatus(t, reg, "middlecccccc", state.StatusRunning, base.Add(-1*time.Hour))
 	seedStatus(t, reg, "oldestcccccc", state.StatusRunning, base.Add(-2*time.Hour))
 	seedStatus(t, reg, "newestcccccc", state.StatusRunning, base)
@@ -460,7 +413,6 @@ func TestContainerList_SortedNewestFirst(t *testing.T) {
 	if len(list) != 3 {
 		t.Fatalf("len: got %d, want 3", len(list))
 	}
-
 	wantOrder := []string{"newestcccccc", "middlecccccc", "oldestcccccc"}
 	for i, want := range wantOrder {
 		if list[i].ID != want {
@@ -469,12 +421,8 @@ func TestContainerList_SortedNewestFirst(t *testing.T) {
 	}
 }
 
-// TestContainerInspect_Success: seed a fully populated container,
-// inspect it, verify the projection lands every field in the right
-// place. Catches regressions in the toInspect / toState / toPorts /
-// toMounts helpers.
 func TestContainerInspect_Success(t *testing.T) {
-	c, reg := newTestDaemon(t, nil, nil)
+	c, reg := newTestDaemon(t, daemon.Deps{})
 
 	const id = "inspectabc12"
 	startedAt := time.Now().Add(-5 * time.Minute).UTC()
@@ -500,14 +448,12 @@ func TestContainerInspect_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ContainerInspect: %v", err)
 	}
-
 	if got.ID != id {
 		t.Errorf("ID: got %q, want %q", got.ID, id)
 	}
 	if got.Image != "alpine:3.19" {
 		t.Errorf("Image: got %q", got.Image)
 	}
-	// Path/Args split: argv[0] and argv[1:]
 	if got.Path != "sh" {
 		t.Errorf("Path: got %q, want %q", got.Path, "sh")
 	}
@@ -517,7 +463,6 @@ func TestContainerInspect_Success(t *testing.T) {
 	if got.IPAddress != "172.42.0.2" {
 		t.Errorf("IPAddress: got %q", got.IPAddress)
 	}
-	// Nested State object carries the Running boolean + PID.
 	if !got.State.Running {
 		t.Error("State.Running: got false, want true")
 	}
@@ -527,17 +472,13 @@ func TestContainerInspect_Success(t *testing.T) {
 	if len(got.Env) != 1 || got.Env[0] != "FOO=bar" {
 		t.Errorf("Env: got %v", got.Env)
 	}
-	// Created timestamp should round-trip as RFC3339 UTC.
 	if _, err := time.Parse(time.RFC3339, got.Created); err != nil {
 		t.Errorf("Created %q: not parseable as RFC3339: %v", got.Created, err)
 	}
 }
 
-// TestContainerInspect_NotFound: unknown id -> 404 surfaced by the
-// client as an error whose message includes the status. Parallels
-// the NotFound test shape used elsewhere in this file.
 func TestContainerInspect_NotFound(t *testing.T) {
-	c, _ := newTestDaemon(t, nil, nil)
+	c, _ := newTestDaemon(t, daemon.Deps{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -548,5 +489,250 @@ func TestContainerInspect_NotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "404") {
 		t.Errorf("error %q: expected 404 in message", err.Error())
+	}
+}
+
+// -------------------- stop / kill / remove tests --------------------
+
+// TestContainerStop_Success: a running container stops successfully,
+// the mock StopInit is invoked with the caller's timeout, and registry
+// state transitions to exited.
+func TestContainerStop_Success(t *testing.T) {
+	var (
+		stopCalled bool
+		sawTimeout time.Duration
+	)
+
+	c, reg := newTestDaemon(t, daemon.Deps{
+		StopInit: func(c *state.Container, timeout time.Duration) error {
+			stopCalled = true
+			sawTimeout = timeout
+			c.Status = state.StatusExited
+			c.FinishedAt = time.Now()
+			return nil
+		},
+	})
+
+	const id = "stoprunninge1"
+	reg.Add(&state.Container{
+		ID:        id,
+		Image:     "alpine",
+		Status:    state.StatusRunning,
+		PID:       1234,
+		CreatedAt: time.Now(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := c.ContainerStop(ctx, id, 5*time.Second); err != nil {
+		t.Fatalf("ContainerStop: %v", err)
+	}
+	if !stopCalled {
+		t.Fatal("StopInit was not invoked")
+	}
+	if sawTimeout != 5*time.Second {
+		t.Errorf("timeout: got %v, want 5s", sawTimeout)
+	}
+	got, _ := reg.Get(id)
+	if got.Status != state.StatusExited {
+		t.Errorf("Status after stop: got %q, want %q", got.Status, state.StatusExited)
+	}
+}
+
+// TestContainerStop_NotRunning: stop on an already-exited container
+// returns 304 (nil to the client). The mock StopInit panics if called,
+// proving the short-circuit works.
+func TestContainerStop_NotRunning(t *testing.T) {
+	c, reg := newTestDaemon(t, daemon.Deps{}) // panic stub
+
+	const id = "alreadyexite"
+	reg.Add(&state.Container{
+		ID:         id,
+		Image:      "alpine",
+		Status:     state.StatusExited,
+		CreatedAt:  time.Now(),
+		FinishedAt: time.Now(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := c.ContainerStop(ctx, id, 0); err != nil {
+		t.Fatalf("ContainerStop on exited: want nil, got %v", err)
+	}
+}
+
+// TestContainerStop_NotFound: unknown id -> 404.
+func TestContainerStop_NotFound(t *testing.T) {
+	c, _ := newTestDaemon(t, daemon.Deps{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := c.ContainerStop(ctx, "nonexistentid", 0)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("error %q: expected 404", err.Error())
+	}
+}
+
+// TestContainerKill_Success: KillInit fires and container flips to exited.
+func TestContainerKill_Success(t *testing.T) {
+	killCalled := false
+	c, reg := newTestDaemon(t, daemon.Deps{
+		KillInit: func(c *state.Container) error {
+			killCalled = true
+			c.Status = state.StatusExited
+			c.FinishedAt = time.Now()
+			return nil
+		},
+	})
+
+	const id = "killrunninge1"
+	reg.Add(&state.Container{
+		ID:        id,
+		Image:     "alpine",
+		Status:    state.StatusRunning,
+		PID:       1234,
+		CreatedAt: time.Now(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := c.ContainerKill(ctx, id); err != nil {
+		t.Fatalf("ContainerKill: %v", err)
+	}
+	if !killCalled {
+		t.Error("KillInit was not invoked")
+	}
+	got, _ := reg.Get(id)
+	if got.Status != state.StatusExited {
+		t.Errorf("Status after kill: got %q", got.Status)
+	}
+}
+
+// TestContainerRemove_Success: a stopped container gets removed cleanly.
+// After the call reg.Get must return ErrNotFound — the container is
+// gone from both memory and disk.
+func TestContainerRemove_Success(t *testing.T) {
+	removeCalled := false
+	c, reg := newTestDaemon(t, daemon.Deps{
+		RemoveInit: func(*state.Container) error {
+			removeCalled = true
+			return nil
+		},
+	})
+
+	const id = "rmexitedabc1"
+	reg.Add(&state.Container{
+		ID:         id,
+		Image:      "alpine",
+		Status:     state.StatusExited,
+		CreatedAt:  time.Now(),
+		FinishedAt: time.Now(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := c.ContainerRemove(ctx, id, false); err != nil {
+		t.Fatalf("ContainerRemove: %v", err)
+	}
+	if !removeCalled {
+		t.Error("RemoveInit was not invoked")
+	}
+	if _, err := reg.Get(id); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("Get after remove: expected ErrNotFound, got %v", err)
+	}
+}
+
+// TestContainerRemove_RunningNoForce: 409 Conflict. Neither Stop nor
+// Remove should fire — both panic stubs would surface that bug.
+func TestContainerRemove_RunningNoForce(t *testing.T) {
+	c, reg := newTestDaemon(t, daemon.Deps{}) // panic stubs everywhere
+
+	const id = "runningnoforc"
+	reg.Add(&state.Container{
+		ID:        id,
+		Image:     "alpine",
+		Status:    state.StatusRunning,
+		PID:       1234,
+		CreatedAt: time.Now(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := c.ContainerRemove(ctx, id, false)
+	if err == nil {
+		t.Fatal("expected 409, got nil")
+	}
+	if !strings.Contains(err.Error(), "409") {
+		t.Errorf("error %q: expected 409 status in message", err.Error())
+	}
+	// Container must still exist.
+	if _, err := reg.Get(id); err != nil {
+		t.Errorf("container should still be present: %v", err)
+	}
+}
+
+// TestContainerRemove_RunningWithForce: force=1 stops-then-removes.
+// Verifies StopInit runs BEFORE RemoveInit (they both succeed here;
+// we just confirm both fired).
+func TestContainerRemove_RunningWithForce(t *testing.T) {
+	var order []string
+	c, reg := newTestDaemon(t, daemon.Deps{
+		StopInit: func(c *state.Container, _ time.Duration) error {
+			order = append(order, "stop")
+			c.Status = state.StatusExited
+			c.FinishedAt = time.Now()
+			return nil
+		},
+		RemoveInit: func(*state.Container) error {
+			order = append(order, "remove")
+			return nil
+		},
+	})
+
+	const id = "forcerunningx"
+	reg.Add(&state.Container{
+		ID:        id,
+		Image:     "alpine",
+		Status:    state.StatusRunning,
+		PID:       1234,
+		CreatedAt: time.Now(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if err := c.ContainerRemove(ctx, id, true); err != nil {
+		t.Fatalf("ContainerRemove force: %v", err)
+	}
+	if len(order) != 2 || order[0] != "stop" || order[1] != "remove" {
+		t.Errorf("call order: got %v, want [stop remove]", order)
+	}
+	if _, err := reg.Get(id); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("container should be gone: %v", err)
+	}
+}
+
+// TestContainerRemove_NotFound: unknown id -> 404.
+func TestContainerRemove_NotFound(t *testing.T) {
+	c, _ := newTestDaemon(t, daemon.Deps{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := c.ContainerRemove(ctx, "nonexistentid", false)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("error %q: expected 404", err.Error())
 	}
 }

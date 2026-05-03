@@ -3,139 +3,79 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
-	"strings"
+	"strconv"
 
 	"github.com/spf13/cobra"
-	"github.com/valkyraycho/my-docker/internal/cgroup"
-	"github.com/valkyraycho/my-docker/internal/container"
-	"github.com/valkyraycho/my-docker/internal/image"
-	"github.com/valkyraycho/my-docker/internal/network"
-	"github.com/valkyraycho/my-docker/internal/overlay"
-	"github.com/valkyraycho/my-docker/internal/registry"
-	"github.com/valkyraycho/my-docker/internal/volume"
+	"github.com/valkyraycho/my-docker/internal/api"
 )
 
-// Flag variables for runCmd. Each maps to a cobra flag registered in the
-// init() below.
+// run-command flags. Stored as package-level vars so cobra can bind them.
 var (
-	runMemMB   int
-	runCPUPct  int
-	runPidsMax int
 	runDetach  bool
 	runVolumes []string
 	runEnv     []string
 	runPorts   []string
 )
 
-// runCmd implements "mydocker run". It resolves the image locally (pulling
-// automatically if missing), mounts an overlay filesystem, applies cgroup
-// resource limits, and forks the container process. With -d the container runs
-// in the background and only the container ID is printed; without -d stdout/
-// stderr stream to the terminal. Flags: -m memory, --cpu, --pids, -d detach,
-// -v volume, -e env, -p port publish.
+// runCmd implements "mydocker run" as CLI-side sugar for
+// ContainerCreate + ContainerStart against the daemon. After M9 the CLI
+// no longer forks container processes directly — the daemon does that.
+//
+// Foreground attach (stdout streaming for non-detached runs) lands in
+// chunk 3. Until then, every `run` is effectively detached: the CLI
+// prints the container ID and returns; logs are available via
+// `mydocker logs`.
 var runCmd = &cobra.Command{
 	Use:   "run [flags] <image> <cmd> [args...]",
-	Short: "Run a command in a new container",
+	Short: "Create and start a container",
 	Args:  cobra.MinimumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := overlay.EnsureRoot(); err != nil {
-			return fmt.Errorf("setup: %w", err)
-		}
-
-		containerID := generateID()
-
-		ref := args[0]
-		cmdArgs := args[1:]
-
-		store := image.New()
-
-		layers, err := store.Resolve(ref)
+		cli, err := getClient()
 		if err != nil {
-			if errors.Is(err, image.ErrImageNotFound) {
-				fmt.Fprintf(os.Stderr, "image %q not found locally, pulling...\n", ref)
-				client := registry.New(image.DefaultRegistry)
-				if err := store.Pull(client, ref); err != nil {
-					return fmt.Errorf("pull: %w", err)
-				}
-				layers, err = store.Resolve(ref)
-			}
-		}
-		if err != nil {
-			return fmt.Errorf("resolve: %w", err)
-		}
-
-		mergedPath, err := overlay.Mount(containerID, layers)
-		if err != nil {
-			return fmt.Errorf("mount: %w", err)
-		}
-		if !runDetach {
-			defer func() {
-				if err := overlay.Unmount(containerID); err != nil {
-					fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
-				}
-			}()
-		}
-
-		limits := cgroup.Limits{
-			MemoryBytes: int64(runMemMB) * 1024 * 1024,
-			CPUPercent:  runCPUPct,
-			PidsMax:     runPidsMax,
-		}
-
-		var specs []*volume.Spec
-		for _, s := range runVolumes {
-			spec, err := volume.Parse(s)
-			if err != nil {
-				return fmt.Errorf("volume: %w", err)
-			}
-			specs = append(specs, spec)
-		}
-
-		var envs []string
-		for _, e := range runEnv {
-			if strings.Contains(e, "=") {
-				envs = append(envs, e)
-			} else {
-				if val, ok := os.LookupEnv(e); ok {
-					envs = append(envs, e+"="+val)
-				}
-			}
-		}
-
-		var ports []*network.PortSpec
-		for _, s := range runPorts {
-			spec, err := network.ParsePortSpec(s)
-			if err != nil {
-				return fmt.Errorf("port: %w", err)
-			}
-			ports = append(ports, spec)
-		}
-
-		opts := container.RunOptions{
-			ContainerID: containerID,
-			Image:       ref,
-			Layers:      layers,
-			Rootfs:      mergedPath,
-			Limits:      limits,
-			Args:        cmdArgs,
-			Detach:      runDetach,
-			Volumes:     specs,
-			Env:         envs,
-			Ports:       ports,
-		}
-
-		if err := container.Run(opts); err != nil {
 			return err
 		}
 
-		if runDetach {
-			fmt.Println(containerID)
+		image := args[0]
+		cmdArgs := args[1:]
+
+		ports, err := parsePublishFlags(runPorts)
+		if err != nil {
+			return fmt.Errorf("publish: %w", err)
 		}
+
+		req := &api.ContainerCreateRequest{
+			Image: image,
+			Cmd:   cmdArgs,
+			Env:   runEnv,
+			HostConfig: api.HostConfig{
+				Binds:        runVolumes,
+				PortBindings: ports,
+			},
+		}
+
+		created, err := cli.ContainerCreate(cmd.Context(), req)
+		if err != nil {
+			return fmt.Errorf("create: %w", err)
+		}
+
+		if err := cli.ContainerStart(cmd.Context(), created.ID); err != nil {
+			// Create succeeded, start failed. The container is in the
+			// registry but not running. Surface the ID so the user can
+			// inspect or clean up (`mydocker rm <id>`).
+			return fmt.Errorf("container %s created but start failed: %w",
+				created.ID, err)
+		}
+
+		// Chunk 3 will add foreground attach. Until then every run is
+		// effectively detached — print the ID so the user can follow up.
+		if !runDetach {
+			fmt.Fprintf(os.Stderr,
+				"note: attach not yet implemented; running detached. Use `mydocker logs %s` to view output.\n",
+				created.ID)
+		}
+		fmt.Println(created.ID)
 		return nil
 	},
 }
@@ -143,18 +83,61 @@ var runCmd = &cobra.Command{
 func init() {
 	f := runCmd.Flags()
 	f.SetInterspersed(false)
-	f.IntVarP(&runMemMB, "memory", "m", 0, "memory limit in MB (0 = no limit)")
-	f.IntVar(&runCPUPct, "cpu", 0, "cpu limit as percent (0 = no limit)")
-	f.IntVar(&runPidsMax, "pids", 0, "max processes (0 = no limit)")
-	f.BoolVarP(&runDetach, "detach", "d", false, "run container in background")
+	f.BoolVarP(&runDetach, "detach", "d", false, "run container in background (currently the default; see note in chunk 3)")
 	f.StringArrayVarP(&runVolumes, "volume", "v", nil, "volume mount (repeatable): src:dst[:ro]")
-	f.StringArrayVarP(&runEnv, "env", "e", nil, "environment variable (repeatable): KEY=VAL or KEY")
-	f.StringArrayVarP(&runPorts, "publish", "p", nil, "publish port (repeatable): hostPort:containerPort")
+	f.StringArrayVarP(&runEnv, "env", "e", nil, "environment variable (repeatable): KEY=VAL")
+	f.StringArrayVarP(&runPorts, "publish", "p", nil, "publish port (repeatable): hostPort:containerPort[/proto]")
 }
 
-// generateID returns a random 12-character hex string used as the container ID.
-func generateID() string {
-	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+// parsePublishFlags converts CLI "-p 8080:80[/tcp]" entries into
+// Docker's nested PortBindings wire shape
+// (map of "80/tcp" -> [{HostPort: "8080"}]). Protocol defaults to tcp.
+// Numeric validation is done here so the user gets a local error
+// instead of a round-trip-to-daemon one.
+func parsePublishFlags(flags []string) (map[string][]api.PortBinding, error) {
+	if len(flags) == 0 {
+		return nil, nil
+	}
+	out := make(map[string][]api.PortBinding, len(flags))
+	for _, raw := range flags {
+		host, cont, ok := splitPort(raw)
+		if !ok {
+			return nil, fmt.Errorf("port spec %q: expected hostPort:containerPort[/proto]", raw)
+		}
+		if _, err := strconv.Atoi(host); err != nil {
+			return nil, fmt.Errorf("host port %q: %w", host, err)
+		}
+		portOnly, _, _ := cutProto(cont)
+		if _, err := strconv.Atoi(portOnly); err != nil {
+			return nil, fmt.Errorf("container port %q: %w", portOnly, err)
+		}
+
+		key := cont
+		if _, hasProto, _ := cutProto(cont); !hasProto {
+			key = cont + "/tcp"
+		}
+		out[key] = append(out[key], api.PortBinding{HostPort: host})
+	}
+	return out, nil
+}
+
+// splitPort splits "host:container[/proto]" on the first colon.
+func splitPort(s string) (host, cont string, ok bool) {
+	for i := range len(s) {
+		if s[i] == ':' {
+			return s[:i], s[i+1:], true
+		}
+	}
+	return "", "", false
+}
+
+// cutProto splits "80/tcp" into ("80", true, "tcp"). If no slash is
+// present returns (s, false, "").
+func cutProto(s string) (port string, hasProto bool, proto string) {
+	for i := range len(s) {
+		if s[i] == '/' {
+			return s[:i], true, s[i+1:]
+		}
+	}
+	return s, false, ""
 }

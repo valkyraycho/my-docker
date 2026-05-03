@@ -63,6 +63,9 @@ func run() int {
 		Registry:   registry,
 		ImageStore: imageStore,
 		StartInit:  container.Start,
+		StopInit:   container.Stop,
+		KillInit:   container.Kill,
+		RemoveInit: container.Remove,
 	}
 
 	handler := daemon.NewHandler(deps)

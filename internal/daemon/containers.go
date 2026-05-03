@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/valkyraycho/my-docker/internal/api"
+	"github.com/valkyraycho/my-docker/internal/container"
 	"github.com/valkyraycho/my-docker/internal/image"
 	"github.com/valkyraycho/my-docker/internal/network"
 	"github.com/valkyraycho/my-docker/internal/state"
@@ -370,4 +371,144 @@ func humanDuration(d time.Duration) string {
 		return fmt.Sprintf("%d hours", int(d/time.Hour))
 	}
 	return fmt.Sprintf("%d days", int(d/(24*time.Hour)))
+}
+
+// handleContainerStop implements POST /containers/{id}/stop.
+//
+// Query params:
+//   t=<seconds> — grace period between SIGTERM and SIGKILL. Default
+//     container.DefaultStopTimeout. A zero or unset value uses the
+//     default; invalid values are rejected with 400.
+//
+// Returns 204 on successful stop, 304 Not Modified if the container
+// wasn't running, 404 if unknown, 500 on runtime failure.
+func (d *Deps) handleContainerStop(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+
+	timeout := container.DefaultStopTimeout
+	if raw := r.URL.Query().Get("t"); raw != "" {
+		secs, err := strconv.Atoi(raw)
+		if err != nil || secs < 0 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid timeout %q", raw))
+			return
+		}
+		timeout = time.Duration(secs) * time.Second
+	}
+
+	c, err := d.Registry.Find(id)
+	if err != nil {
+		writeError(w, statusForError(err), err)
+		return
+	}
+
+	if c.Status != state.StatusRunning {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	if err := d.StopInit(c, timeout); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("stop: %w", err))
+		return
+	}
+
+	if err := d.Registry.Update(c); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("persist state: %w", err))
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleContainerKill implements POST /containers/{id}/kill.
+// Immediate SIGKILL — no grace, no timeout.
+//
+// Returns 204 on success, 304 Not Modified if not running, 404 if unknown.
+func (d *Deps) handleContainerKill(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+
+	c, err := d.Registry.Find(id)
+	if err != nil {
+		writeError(w, statusForError(err), err)
+		return
+	}
+
+	if c.Status != state.StatusRunning {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	if err := d.KillInit(c); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("kill: %w", err))
+		return
+	}
+
+	if err := d.Registry.Update(c); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("persist state: %w", err))
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleContainerRemove implements DELETE /containers/{id}.
+//
+// Query params:
+//   force=1 (or true) — stop the container first if it's running.
+//     Without force, a running container produces 409 Conflict.
+//
+// Returns 204 on success, 404 if unknown, 409 if running without force,
+// 500 on teardown failure.
+func (d *Deps) handleContainerRemove(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+
+	q := r.URL.Query().Get("force")
+	force := q == "1" || q == "true"
+
+	c, err := d.Registry.Find(id)
+	if err != nil {
+		writeError(w, statusForError(err), err)
+		return
+	}
+
+	if c.Status == state.StatusRunning {
+		if !force {
+			writeError(w, http.StatusConflict,
+				errors.New("container is running; stop it first or use force"))
+			return
+		}
+		if err := d.StopInit(c, container.DefaultStopTimeout); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("stop before remove: %w", err))
+			return
+		}
+		// Persist the stop so a subsequent RemoveInit failure leaves a
+		// consistent registry view instead of a ghost "running" entry.
+		if err := d.Registry.Update(c); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("persist stop: %w", err))
+			return
+		}
+	}
+
+	if err := d.RemoveInit(c); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("teardown: %w", err))
+		return
+	}
+
+	if err := d.Registry.Remove(c.ID); err != nil {
+		writeError(w, statusForError(err), err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }

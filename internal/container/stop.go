@@ -12,59 +12,77 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// DefaultStopTimeout is the grace period between SIGTERM and SIGKILL.
-// This matches Docker's default: give the process 10 s to clean up before
-// forcibly killing it.
+// DefaultStopTimeout is the grace period between SIGTERM and SIGKILL
+// when the caller doesn't specify one. Matches Docker's default.
 const DefaultStopTimeout = 10 * time.Second
 
-// Stop sends SIGTERM to the container's init process and waits up to timeout
-// for a graceful exit. If the process is still alive, it sends SIGKILL and
-// waits briefly before marking the container as exited.
-func Stop(prefix string, timeout time.Duration) error {
-	c, err := state.Find(prefix)
-	if err != nil {
-		return fmt.Errorf("find container: %w", err)
-	}
-
+// Stop graceful-stops a running container. Sends SIGTERM and waits up
+// to timeout for the process to exit; if it hasn't, escalates to
+// SIGKILL. Mutates c in place — caller persists via Registry.Update.
+//
+// If the process is already gone (PID reused, never ran, or exited
+// before we got here), the function is idempotent and marks the
+// container as Exited without signaling anything.
+//
+// Exit code tracking is deferred to chunk 6 (shim/reconciliation).
+// For now c.ExitCode is left unchanged.
+func Stop(c *state.Container, timeout time.Duration) error {
 	if !state.IsRunning(c.PID, c.StartTime) {
-		return reconcileExited(c)
+		markExited(c)
+		return nil
 	}
 
-	if err := unix.Kill(c.PID, unix.SIGTERM); err != nil {
-		if !errors.Is(err, unix.ESRCH) {
-			return fmt.Errorf("sigterm: %w", err)
-		}
+	if err := unix.Kill(c.PID, unix.SIGTERM); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("sigterm: %w", err)
 	}
 
 	if waitForExit(c, timeout) {
-		return reconcileExited(c)
+		markExited(c)
+		return nil
 	}
 
-	if err := unix.Kill(c.PID, unix.SIGKILL); err != nil {
-		if !errors.Is(err, unix.ESRCH) {
-			return fmt.Errorf("sigkill: %w", err)
-		}
+	// Graceful window elapsed — escalate.
+	if err := unix.Kill(c.PID, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("sigkill: %w", err)
 	}
-
 	waitForExit(c, time.Second)
-	return reconcileExited(c)
-}
-
-// reconcileExited marks the container's persisted state as exited. It is called
-// both when the container stopped on its own and after a forced kill, so state
-// is always consistent regardless of how the process ended.
-func reconcileExited(c *state.Container) error {
-	c.Status = state.StatusExited
-	c.FinishedAt = time.Now()
-
-	if err := c.Save(); err != nil {
-		return fmt.Errorf("save state: %w", err)
-	}
+	markExited(c)
 	return nil
 }
 
-// waitForExit polls IsRunning every 100 ms until the process exits or the
-// timeout elapses. Returns true if the process exited within the deadline.
+// Kill is Stop's impatient cousin: SIGKILL immediately, short wait,
+// mark exited. Used by POST /containers/{id}/kill.
+func Kill(c *state.Container) error {
+	if !state.IsRunning(c.PID, c.StartTime) {
+		markExited(c)
+		return nil
+	}
+
+	if err := unix.Kill(c.PID, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("sigkill: %w", err)
+	}
+
+	waitForExit(c, 2*time.Second)
+	markExited(c)
+	return nil
+}
+
+// markExited stamps c with the exit-time invariants. Does NOT persist;
+// the caller owns writing through Registry.Update.
+func markExited(c *state.Container) {
+	c.Status = state.StatusExited
+	if c.FinishedAt.IsZero() {
+		c.FinishedAt = time.Now()
+	}
+}
+
+// waitForExit polls (PID, StartTime) every 100 ms until the process is
+// gone or the timeout elapses. Returns true on exit, false on timeout.
+//
+// Polling is cheap against /proc and avoids a kernel-level Wait that
+// would require us to own the *exec.Cmd handle (we don't, because
+// Start returns after forking). In chunk 5 the shim will hold the Wait
+// and give us proper exit-code retrieval.
 func waitForExit(c *state.Container, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

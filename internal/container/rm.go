@@ -13,30 +13,28 @@ import (
 	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
-// Rm removes a stopped container and releases all its resources: volume bind
-// mounts, the overlay filesystem, the cgroup directory, the state directory,
-// and any network interfaces and iptables rules. If force is true and the
-// container is still running, Stop is called first. Errors from each teardown
-// step are accumulated with errors.Join so a single failure doesn't prevent
-// the remaining cleanup.
-func Rm(prefix string, force bool) error {
-	c, err := state.Find(prefix)
-	if err != nil {
-		return fmt.Errorf("find container: %w", err)
-	}
-
-	if state.IsRunning(c.PID, c.StartTime) {
-		if !force {
-			return errors.New("container is running; stop first or use -f")
-		}
-		if err := Stop(prefix, DefaultStopTimeout); err != nil {
-			return fmt.Errorf("stop before remove: %w", err)
-		}
-	}
+// Remove releases all host resources for a stopped container:
+//   - volume bind mounts
+//   - the OverlayFS merged mount
+//   - the cgroup directory
+//   - any network interfaces and iptables rules
+//
+// The container's state-directory removal is NOT done here — the
+// caller (daemon handler) persists the "removed" step via
+// Registry.Remove, which owns the on-disk deletion.
+//
+// Pre-condition: the container is stopped. The handler enforces this
+// (409 Conflict without ?force=1); Remove itself does not restart.
+//
+// Errors from each teardown step are accumulated with errors.Join so
+// a single partial failure doesn't prevent the remaining cleanup —
+// better to leak one of five resources than all of them.
+func Remove(c *state.Container) error {
 	var errs []error
 
+	rootfs := overlay.MergedPath(c.ID)
 	for _, spec := range c.Volumes {
-		if err := volume.Unmount(spec, overlay.MergedPath(c.ID)); err != nil {
+		if err := volume.Unmount(spec, rootfs); err != nil {
 			errs = append(errs, fmt.Errorf("unmount volume %s: %w", spec.Target, err))
 		}
 	}
@@ -48,10 +46,6 @@ func Rm(prefix string, force bool) error {
 	cg := cgroup.New(c.ID)
 	if err := cg.Destroy(); err != nil {
 		errs = append(errs, fmt.Errorf("destroy cgroup: %w", err))
-	}
-
-	if err := state.RemoveDir(c.ID); err != nil {
-		errs = append(errs, fmt.Errorf("remove container state directory: %w", err))
 	}
 
 	if err := network.Teardown(c.ID, c.Ports, c.IP); err != nil {

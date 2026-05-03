@@ -11,6 +11,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
+	"strconv"
+	"time"
 
 	"github.com/valkyraycho/my-docker/internal/api"
 )
@@ -193,4 +196,66 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (*api.Containe
 	}
 
 	return &result, nil
+}
+
+// doNoBody is the shared pattern for "send a request with no body,
+// expect a specific set of successful statuses, otherwise decode the
+// error envelope and return a formatted error." Every state-change
+// endpoint on the daemon has this exact shape.
+//
+// Kept as a receiver method so callers get the client's transport
+// without threading httpClient through. okStatuses lets each method
+// declare which response codes count as success (e.g. Start treats
+// 204 AND 304 as OK; Kill only 204).
+func (c *Client) doNoBody(ctx context.Context, method, url string, okStatuses ...int) error {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if slices.Contains(okStatuses, resp.StatusCode) {
+		return nil
+	}
+
+	var errBody api.ErrorResponse
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&errBody)
+	return fmt.Errorf("daemon returned %s: %s", resp.Status, errBody.Message)
+}
+
+// ContainerStop calls POST /containers/{id}/stop?t=<seconds>.
+// Zero timeout (the Go zero value) omits the query param and lets the
+// daemon apply its default (10s). Returns nil for both 204 (stopped)
+// and 304 (not running) — "the container is not running now" is the
+// contracted outcome in both cases.
+func (c *Client) ContainerStop(ctx context.Context, id string, timeout time.Duration) error {
+	url := dummyHost + "/containers/" + id + "/stop"
+	if timeout > 0 {
+		url += "?t=" + strconv.Itoa(int(timeout.Seconds()))
+	}
+	return c.doNoBody(ctx, http.MethodPost, url, http.StatusNoContent, http.StatusNotModified)
+}
+
+// ContainerKill calls POST /containers/{id}/kill. SIGKILL, no grace.
+// Returns nil for 204 and 304 for the same reason Stop does.
+func (c *Client) ContainerKill(ctx context.Context, id string) error {
+	return c.doNoBody(ctx, http.MethodPost,
+		dummyHost+"/containers/"+id+"/kill",
+		http.StatusNoContent, http.StatusNotModified)
+}
+
+// ContainerRemove calls DELETE /containers/{id} and optionally
+// ?force=1. Returns nil only for 204 — running-without-force produces
+// 409 Conflict which the caller sees as a non-nil error.
+func (c *Client) ContainerRemove(ctx context.Context, id string, force bool) error {
+	url := dummyHost + "/containers/" + id
+	if force {
+		url += "?force=1"
+	}
+	return c.doNoBody(ctx, http.MethodDelete, url, http.StatusNoContent)
 }
