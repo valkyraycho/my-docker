@@ -8,3 +8,9 @@ test-container:
 		-v $(PWD)/bin:/usr/local/bin \
 		-v $(PWD)/rootfs-cache:/rootfs-cache \
 		mydocker-vm:latest bash
+
+test:
+	docker run --rm \
+		-v $(PWD):/app -w /app \
+		golang:1.25 \
+		go test -race ./...

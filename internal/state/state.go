@@ -18,7 +18,7 @@ const (
 	StatusExited  = "exited"
 )
 
-const containersDir = "/var/lib/mydocker/containers"
+var containersDir = "/var/lib/mydocker/containers"
 
 type Container struct {
 	// Identity
