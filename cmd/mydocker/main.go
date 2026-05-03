@@ -43,3 +43,7 @@ func main() {
 	fmt.Fprintln(os.Stderr, "Error:", err)
 	os.Exit(1)
 }
+
+func init() {
+	rootCmd.PersistentFlags().StringVarP(&hostFlag, "host", "H", "", "Daemon socket to connect to (unix://path or env MYDOCKER_HOST)")
+}
