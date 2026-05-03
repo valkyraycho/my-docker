@@ -9,10 +9,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/valkyraycho/my-docker/internal/api"
+	"github.com/valkyraycho/my-docker/internal/image"
+	"github.com/valkyraycho/my-docker/internal/network"
 	"github.com/valkyraycho/my-docker/internal/state"
+	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
 func (d *Deps) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
@@ -28,14 +33,44 @@ func (d *Deps) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	layers, err := d.ImageStore.Resolve(req.Image)
+	if err != nil {
+		if errors.Is(err, image.ErrImageNotFound) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("image %q not found: %w", req.Image, err))
+			return
+		}
+
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("resolve image: %w", err))
+		return
+	}
+
+	volumes := make([]*volume.Spec, 0, len(req.HostConfig.Binds))
+	for _, b := range req.HostConfig.Binds {
+		spec, err := volume.Parse(b)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("parse volume spec: %w", err))
+			return
+		}
+		volumes = append(volumes, spec)
+	}
+
+	ports, err := parsePortBindings(req.HostConfig.PortBindings)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("parse port bindings: %w", err))
+		return
+	}
+
 	id := newContainerID()
 
 	container := state.Container{
 		ID:        id,
 		Image:     req.Image,
+		Layers:    layers,
 		Command:   req.Cmd,
 		Status:    state.StatusCreated,
 		CreatedAt: time.Now(),
+		Volumes:   volumes,
+		Ports:     ports,
 	}
 
 	if err := d.Registry.Add(&container); err != nil {
@@ -76,4 +111,63 @@ func statusForError(err error) int {
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+// parsePortBindings translates Docker's wire-format port binding map
+// into our internal network.PortSpec slice.
+//
+// Docker's shape:
+//
+//	{ "80/tcp": [{"HostIp":"", "HostPort":"8080"}] }
+//
+// Expansions:
+//   - Map key is "<container_port>[/<proto>]"; proto defaults to "tcp".
+//   - Value is a list of host bindings; we honor only the first one.
+//   - Empty host list (len 0) is "publish to random free host port"
+//     in Docker. We skip for M9 and error on it.
+//   - Non-tcp protocols (udp, sctp) are rejected; our network stack
+//     only wires TCP right now.
+func parsePortBindings(bindings map[string][]api.PortBinding) ([]*network.PortSpec, error) {
+	specs := make([]*network.PortSpec, 0, len(bindings))
+	for key, hosts := range bindings {
+		portStr, proto, _ := strings.Cut(key, "/")
+		if proto == "" {
+			proto = "tcp"
+		}
+		if proto != "tcp" {
+			return nil, fmt.Errorf("port %s: only tcp supported", key)
+		}
+
+		containerPort, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("parse port %s: %w", portStr, err)
+		}
+
+		if containerPort < 1 || containerPort > 65535 {
+			return nil, fmt.Errorf("invalid container port %d, must be between 1 and 65535", containerPort)
+		}
+
+		if len(hosts) == 0 {
+			return nil, fmt.Errorf("port %s: empty host bindings", key)
+		}
+		if len(hosts) > 1 {
+			return nil, fmt.Errorf("port %s: multiple bindings not supported", key)
+		}
+
+		hostPort, err := strconv.Atoi(hosts[0].HostPort)
+		if err != nil {
+			return nil, fmt.Errorf("parse host port %s: %w", hosts[0].HostPort, err)
+		}
+
+		if hostPort < 1 || hostPort > 65535 {
+			return nil, fmt.Errorf("invalid host port %d, must be between 1 and 65535", hostPort)
+		}
+
+		specs = append(specs, &network.PortSpec{
+			HostPort:      hostPort,
+			ContainerPort: containerPort,
+			Protocol:      proto,
+		})
+	}
+	return specs, nil
 }

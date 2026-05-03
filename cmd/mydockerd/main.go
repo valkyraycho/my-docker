@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/valkyraycho/my-docker/internal/daemon"
+	"github.com/valkyraycho/my-docker/internal/image"
 	"github.com/valkyraycho/my-docker/internal/state"
 	"golang.org/x/sys/unix"
 )
@@ -42,8 +43,15 @@ func run() int {
 		return 1
 	}
 
+	imageStore := image.New()
+	if err := imageStore.EnsureDirs(); err != nil {
+		fmt.Fprintf(os.Stderr, "init image store: %v\n", err)
+		return 1
+	}
+
 	deps := &daemon.Deps{
-		Registry: registry,
+		Registry:   registry,
+		ImageStore: imageStore,
 	}
 
 	handler := daemon.NewHandler(deps)

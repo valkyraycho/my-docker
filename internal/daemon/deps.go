@@ -2,8 +2,12 @@
 
 package daemon
 
-import "github.com/valkyraycho/my-docker/internal/state"
+import (
+	"github.com/valkyraycho/my-docker/internal/image"
+	"github.com/valkyraycho/my-docker/internal/state"
+)
 
 type Deps struct {
-	Registry *state.Registry
+	Registry   *state.Registry
+	ImageStore *image.Store
 }
