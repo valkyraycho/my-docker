@@ -3,12 +3,14 @@
 package daemon
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -214,4 +216,158 @@ func (d *Deps) handleContainerStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (d *Deps) handleContainerList(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("all")
+	all := q == "1" || q == "true"
+
+	containers, err := d.Registry.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("list containers: %w", err))
+		return
+	}
+
+	out := make([]api.ContainerSummary, 0, len(containers))
+	for _, c := range containers {
+		if !all && c.Status != state.StatusRunning {
+			continue
+		}
+
+		out = append(out, toSummary(c))
+	}
+
+	slices.SortFunc(out, func(a, b api.ContainerSummary) int {
+		return cmp.Compare(b.Created, a.Created)
+	})
+
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (d *Deps) handleContainerInspect(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+
+	c, err := d.Registry.Find(id)
+	if err != nil {
+		writeError(w, statusForError(err), err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toInspect(c))
+}
+
+func toSummary(c *state.Container) api.ContainerSummary {
+	return api.ContainerSummary{
+		ID:      c.ID,
+		Image:   c.Image,
+		Command: strings.Join(c.Command, " "),
+		Created: c.CreatedAt.UTC().Unix(),
+		State:   c.Status,
+		Status:  humanStatus(c),
+		Ports:   toPorts(c),
+	}
+}
+
+func toInspect(c *state.Container) api.ContainerInspect {
+	var path string
+	var args []string
+
+	if len(c.Command) > 0 {
+		path = c.Command[0]
+		args = c.Command[1:]
+	}
+
+	return api.ContainerInspect{
+		ID:        c.ID,
+		Created:   c.CreatedAt.UTC().Format(time.RFC3339),
+		Path:      path,
+		Args:      args,
+		State:     toState(c),
+		Image:     c.Image,
+		Env:       c.Env,
+		Mounts:    toMounts(c),
+		Ports:     toPorts(c),
+		IPAddress: c.IP,
+	}
+}
+
+func toState(c *state.Container) api.ContainerState {
+	return api.ContainerState{
+		Status:     c.Status,
+		Running:    c.Status == state.StatusRunning,
+		Pid:        c.PID,
+		ExitCode:   c.ExitCode,
+		StartedAt:  rfc3339OrZero(c.StartedAt),
+		FinishedAt: rfc3339OrZero(c.FinishedAt),
+	}
+}
+
+func rfc3339OrZero(t time.Time) string {
+	if t.IsZero() {
+		return time.Time{}.UTC().Format(time.RFC3339)
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+func toPorts(c *state.Container) []api.Port {
+	out := make([]api.Port, 0, len(c.Ports))
+	for _, p := range c.Ports {
+		out = append(out, api.Port{
+			PrivatePort: p.ContainerPort,
+			PublicPort:  p.HostPort,
+			Type:        p.Protocol,
+		})
+	}
+	return out
+}
+
+func toMounts(c *state.Container) []api.MountPoint {
+	out := make([]api.MountPoint, 0, len(c.Volumes))
+	for _, v := range c.Volumes {
+		mtype := "volume"
+		if v.Kind == volume.Bind {
+			mtype = "bind"
+		}
+
+		out = append(out, api.MountPoint{
+			Type:        mtype,
+			Source:      v.Source,
+			Destination: v.Target,
+			RW:          !v.ReadOnly,
+		})
+	}
+	return out
+}
+func humanStatus(c *state.Container) string {
+	switch c.Status {
+	case state.StatusCreated:
+		return "Created"
+	case state.StatusRunning:
+		return "Up " + humanDuration(time.Since(c.StartedAt))
+	case state.StatusExited:
+		return fmt.Sprintf("Exited (%d) %s ago", c.ExitCode, humanDuration(time.Since(c.FinishedAt)))
+	}
+	return c.Status
+}
+
+func humanDuration(d time.Duration) string {
+	if d < time.Second {
+		return "Less than a second"
+	}
+
+	if d < time.Minute {
+		return fmt.Sprintf("%d seconds", int(d/time.Second))
+	}
+
+	if d < time.Hour {
+		return fmt.Sprintf("%d minutes", int(d/time.Minute))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%d hours", int(d/time.Hour))
+	}
+	return fmt.Sprintf("%d days", int(d/(24*time.Hour)))
 }

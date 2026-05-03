@@ -17,6 +17,8 @@ func NewHandler(deps *Deps) http.Handler {
 	if deps != nil {
 		mux.HandleFunc("POST /containers/create", deps.handleContainerCreate)
 		mux.HandleFunc("POST /containers/{id}/start", deps.handleContainerStart)
+		mux.HandleFunc("GET /containers/json", deps.handleContainerList)
+		mux.HandleFunc("GET /containers/{id}/json", deps.handleContainerInspect)
 	}
 	return mux
 }

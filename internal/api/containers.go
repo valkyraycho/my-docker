@@ -50,3 +50,71 @@ type ContainerCreateResponse struct {
 	ID       string   `json:"Id"`       // Docker's field is "Id" (two letters), not "ID"
 	Warnings []string `json:"Warnings"` // always non-null, even when empty
 }
+
+// ContainerSummary is one entry returned by GET /containers/json.
+// Keep field names identical to Docker's wire format: any cross-tool
+// script that parses `docker ps -a --format='{{json .}}'` should
+// parse mydocker's output with zero changes.
+type ContainerSummary struct {
+	ID      string `json:"Id"`
+	Image   string `json:"Image"`
+	Command string `json:"Command"` // space-joined argv, single string for display
+	Created int64  `json:"Created"` // Unix timestamp in seconds
+	State   string `json:"State"`   // "created" | "running" | "exited"
+	Status  string `json:"Status"`  // human readable: "Up 5 minutes", "Exited (0) 2 hours ago"
+	Ports   []Port `json:"Ports"`   // always non-null; empty slice if none
+}
+
+// Port is Docker's flat port-summary shape used inside ContainerSummary
+// and NetworkSettings. Distinct from PortBinding (which appears in
+// request bodies). Docker uses different shapes for these on purpose:
+// bindings are inputs, Ports is a view of resolved state.
+type Port struct {
+	IP          string `json:"IP,omitempty"`         // host IP, empty means "all"
+	PrivatePort int    `json:"PrivatePort"`          // container port
+	PublicPort  int    `json:"PublicPort,omitempty"` // host port, 0 when not published
+	Type        string `json:"Type"`                 // "tcp" | "udp" (we only emit tcp for now)
+}
+
+// ContainerInspect is the response body for GET /containers/{id}/json.
+// More detailed than ContainerSummary — one container's full story.
+//
+// Simplified from Docker's schema: IP lives at top-level IPAddress
+// instead of NetworkSettings.Networks["bridge"].IPAddress, and Env
+// lives top-level instead of Config.Env. When/if we add multi-network
+// or multi-config support, these flatten positions move under proper
+// nested objects.
+type ContainerInspect struct {
+	ID        string         `json:"Id"`
+	Created   string         `json:"Created"`   // RFC3339 timestamp
+	Path      string         `json:"Path"`      // argv[0] — the program to exec
+	Args      []string       `json:"Args"`      // argv[1:] — program arguments
+	State     ContainerState `json:"State"`     // nested lifecycle view
+	Image     string         `json:"Image"`     // image reference, e.g. "alpine:3.19"
+	Env       []string       `json:"Env"`       // simplified: top-level, not under Config
+	Mounts    []MountPoint   `json:"Mounts"`    // volumes attached to this container
+	Ports     []Port         `json:"Ports"`     // same Port shape as in list
+	IPAddress string         `json:"IPAddress"` // simplified: top-level, not under NetworkSettings
+}
+
+// ContainerState is the nested State object inside ContainerInspect.
+// Running is a redundant-but-useful quick-check boolean; callers that
+// only need "is it alive" don't have to string-match Status.
+type ContainerState struct {
+	Status     string `json:"Status"`     // "created" | "running" | "exited"
+	Running    bool   `json:"Running"`    // Status == "running"
+	Pid        int    `json:"Pid"`        // process id, 0 if not running
+	ExitCode   int    `json:"ExitCode"`   // last exit code, 0 if never exited
+	StartedAt  string `json:"StartedAt"`  // RFC3339 or zero-time "0001-01-01T00:00:00Z"
+	FinishedAt string `json:"FinishedAt"` // RFC3339 or zero-time
+}
+
+// MountPoint mirrors Docker's Mounts[] entry shape. "Type" is the
+// volume kind ("bind" or "volume"); "Source" is either a host path
+// (for bind) or a volume name (for named/anonymous volumes).
+type MountPoint struct {
+	Type        string `json:"Type"`        // "bind" | "volume"
+	Source      string `json:"Source"`      // host path or volume name
+	Destination string `json:"Destination"` // path inside the container
+	RW          bool   `json:"RW"`          // true if read-write (opposite of ReadOnly)
+}
