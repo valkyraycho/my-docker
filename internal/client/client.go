@@ -114,3 +114,24 @@ func (c *Client) ContainerCreate(ctx context.Context, req *api.ContainerCreateRe
 
 	return &result, nil
 }
+
+func (c *Client) ContainerStart(ctx context.Context, id string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dummyHost+"/containers/"+id+"/start", nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusNotModified:
+		return nil
+	default:
+		var errBody api.ErrorResponse
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&errBody)
+		return fmt.Errorf("daemon returned %s: %s", resp.Status, errBody.Message)
+	}
+}
