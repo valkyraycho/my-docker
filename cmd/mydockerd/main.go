@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/valkyraycho/my-docker/internal/container"
 	"github.com/valkyraycho/my-docker/internal/daemon"
 	"github.com/valkyraycho/my-docker/internal/image"
 	"github.com/valkyraycho/my-docker/internal/state"
@@ -61,6 +62,7 @@ func run() int {
 	deps := &daemon.Deps{
 		Registry:   registry,
 		ImageStore: imageStore,
+		StartInit:  container.Start,
 	}
 
 	handler := daemon.NewHandler(deps)
@@ -98,6 +100,7 @@ func run() int {
 	}
 
 }
+
 // parseHost strips the "unix://" scheme prefix and returns the bare socket
 // path. It rejects non-unix schemes because the daemon only binds to a local
 // UNIX socket.

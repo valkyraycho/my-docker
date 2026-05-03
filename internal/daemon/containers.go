@@ -184,3 +184,34 @@ func parsePortBindings(bindings map[string][]api.PortBinding) ([]*network.PortSp
 	}
 	return specs, nil
 }
+
+func (d *Deps) handleContainerStart(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+
+	c, err := d.Registry.Find(id)
+	if err != nil {
+		writeError(w, statusForError(err), err)
+		return
+	}
+
+	if c.Status == state.StatusRunning {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	if err := d.StartInit(c); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("start: %w", err))
+		return
+	}
+
+	if err := d.Registry.Update(c); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("persist state: %w", err))
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}

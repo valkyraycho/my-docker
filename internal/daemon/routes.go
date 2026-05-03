@@ -16,6 +16,7 @@ func NewHandler(deps *Deps) http.Handler {
 	mux.HandleFunc("GET /_ping", handlePing)
 	if deps != nil {
 		mux.HandleFunc("POST /containers/create", deps.handleContainerCreate)
+		mux.HandleFunc("POST /containers/{id}/start", deps.handleContainerStart)
 	}
 	return mux
 }

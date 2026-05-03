@@ -20,4 +20,5 @@ type ImageResolver interface {
 type Deps struct {
 	Registry   *state.Registry
 	ImageStore ImageResolver
+	StartInit  func(c *state.Container) error
 }
