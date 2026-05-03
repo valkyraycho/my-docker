@@ -135,3 +135,62 @@ func (c *Client) ContainerStart(ctx context.Context, id string) error {
 		return fmt.Errorf("daemon returned %s: %s", resp.Status, errBody.Message)
 	}
 }
+
+func (c *Client) ContainerList(ctx context.Context, all bool) ([]api.ContainerSummary, error) {
+	url := dummyHost + "/containers/json"
+	if all {
+		url += "?all=1"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errBody api.ErrorResponse
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&errBody)
+		return nil, fmt.Errorf("daemon returned %s: %s", resp.Status, errBody.Message)
+	}
+
+	var result []api.ContainerSummary
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}
+
+	return result, nil
+}
+
+func (c *Client) ContainerInspect(ctx context.Context, id string) (*api.ContainerInspect, error) {
+	url := dummyHost + "/containers/" + id + "/json"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errBody api.ErrorResponse
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&errBody)
+		return nil, fmt.Errorf("daemon returned %s: %s", resp.Status, errBody.Message)
+	}
+
+	var result api.ContainerInspect
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}
+
+	return &result, nil
+}

@@ -8,22 +8,27 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/valkyraycho/my-docker/internal/state"
 )
 
-// inspectCmd implements "mydocker inspect". It loads the persisted state for
-// the given container ID and pretty-prints it as indented JSON.
+// inspectCmd implements "mydocker inspect". It asks the daemon for the
+// container's full state via GET /containers/{id}/json and pretty-prints
+// the response as indented JSON — same shape `docker inspect` produces.
 var inspectCmd = &cobra.Command{
 	Use:   "inspect <id>",
 	Short: "Display detailed information about a container",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := state.Find(args[0])
+		cli, err := getClient()
 		if err != nil {
 			return err
 		}
 
-		b, err := json.MarshalIndent(c, "", "  ")
+		info, err := cli.ContainerInspect(cmd.Context(), args[0])
+		if err != nil {
+			return fmt.Errorf("inspect: %w", err)
+		}
+
+		b, err := json.MarshalIndent(info, "", "  ")
 		if err != nil {
 			return fmt.Errorf("marshal state: %w", err)
 		}

@@ -340,3 +340,213 @@ func TestContainerStart_InitFailure(t *testing.T) {
 			got.Status, state.StatusCreated)
 	}
 }
+
+// -------------------- container list / inspect tests --------------------
+
+// seedStatus adds a container with the given status and timestamp.
+// Used to build fixtures that exercise the list endpoint's filter
+// and ordering logic.
+func seedStatus(t *testing.T, reg *state.Registry, id, status string, createdAt time.Time) {
+	t.Helper()
+	c := &state.Container{
+		ID:        id,
+		Image:     "alpine",
+		Command:   []string{"sh"},
+		Status:    status,
+		CreatedAt: createdAt,
+	}
+	if status == state.StatusRunning {
+		c.PID = 1234
+		c.StartedAt = createdAt.Add(time.Second)
+	}
+	if status == state.StatusExited {
+		c.StartedAt = createdAt.Add(time.Second)
+		c.FinishedAt = createdAt.Add(2 * time.Second)
+	}
+	if err := reg.Add(c); err != nil {
+		t.Fatalf("seed Add %s: %v", id, err)
+	}
+}
+
+// TestContainerList_Empty: no containers -> empty slice, never nil.
+// Important because Go's json.Marshal on a nil slice emits `null`, which
+// would break clients expecting to iterate an array. The daemon's
+// handler explicitly allocates an empty slice to avoid that.
+func TestContainerList_Empty(t *testing.T) {
+	c, _ := newTestDaemon(t, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	list, err := c.ContainerList(ctx, false)
+	if err != nil {
+		t.Fatalf("ContainerList: %v", err)
+	}
+	if list == nil {
+		t.Error("expected empty slice, got nil")
+	}
+	if len(list) != 0 {
+		t.Errorf("len: got %d, want 0", len(list))
+	}
+}
+
+// TestContainerList_FiltersRunningOnly: with all=false the endpoint
+// hides non-running containers. Matches `docker ps` default behavior.
+func TestContainerList_FiltersRunningOnly(t *testing.T) {
+	c, reg := newTestDaemon(t, nil, nil)
+
+	now := time.Now()
+	seedStatus(t, reg, "cccccccccccc", state.StatusCreated, now)
+	seedStatus(t, reg, "rrrrrrrrrrrr", state.StatusRunning, now)
+	seedStatus(t, reg, "eeeeeeeeeeee", state.StatusExited, now)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	list, err := c.ContainerList(ctx, false)
+	if err != nil {
+		t.Fatalf("ContainerList: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("len: got %d, want 1", len(list))
+	}
+	if list[0].ID != "rrrrrrrrrrrr" {
+		t.Errorf("ID: got %q, want %q", list[0].ID, "rrrrrrrrrrrr")
+	}
+}
+
+// TestContainerList_AllIncludesStopped: with all=true all three
+// statuses come back. Matches `docker ps -a`.
+func TestContainerList_AllIncludesStopped(t *testing.T) {
+	c, reg := newTestDaemon(t, nil, nil)
+
+	now := time.Now()
+	seedStatus(t, reg, "cccccccccccc", state.StatusCreated, now)
+	seedStatus(t, reg, "rrrrrrrrrrrr", state.StatusRunning, now)
+	seedStatus(t, reg, "eeeeeeeeeeee", state.StatusExited, now)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	list, err := c.ContainerList(ctx, true)
+	if err != nil {
+		t.Fatalf("ContainerList: %v", err)
+	}
+	if len(list) != 3 {
+		t.Errorf("len: got %d, want 3", len(list))
+	}
+}
+
+// TestContainerList_SortedNewestFirst: handler sorts by CreatedAt desc
+// so the most recent container shows up first. Matches Docker's UX
+// where newly-created containers appear at the top of `ps` output.
+func TestContainerList_SortedNewestFirst(t *testing.T) {
+	c, reg := newTestDaemon(t, nil, nil)
+
+	base := time.Now()
+	// Intentionally seed out of chronological order to prove the sort
+	// is doing work, not just preserving insertion order.
+	seedStatus(t, reg, "middlecccccc", state.StatusRunning, base.Add(-1*time.Hour))
+	seedStatus(t, reg, "oldestcccccc", state.StatusRunning, base.Add(-2*time.Hour))
+	seedStatus(t, reg, "newestcccccc", state.StatusRunning, base)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	list, err := c.ContainerList(ctx, false)
+	if err != nil {
+		t.Fatalf("ContainerList: %v", err)
+	}
+	if len(list) != 3 {
+		t.Fatalf("len: got %d, want 3", len(list))
+	}
+
+	wantOrder := []string{"newestcccccc", "middlecccccc", "oldestcccccc"}
+	for i, want := range wantOrder {
+		if list[i].ID != want {
+			t.Errorf("position %d: got %q, want %q", i, list[i].ID, want)
+		}
+	}
+}
+
+// TestContainerInspect_Success: seed a fully populated container,
+// inspect it, verify the projection lands every field in the right
+// place. Catches regressions in the toInspect / toState / toPorts /
+// toMounts helpers.
+func TestContainerInspect_Success(t *testing.T) {
+	c, reg := newTestDaemon(t, nil, nil)
+
+	const id = "inspectabc12"
+	startedAt := time.Now().Add(-5 * time.Minute).UTC()
+	seed := &state.Container{
+		ID:        id,
+		Image:     "alpine:3.19",
+		Command:   []string{"sh", "-c", "echo hi"},
+		Env:       []string{"FOO=bar"},
+		Status:    state.StatusRunning,
+		PID:       4242,
+		IP:        "172.42.0.2",
+		CreatedAt: startedAt.Add(-1 * time.Second),
+		StartedAt: startedAt,
+	}
+	if err := reg.Add(seed); err != nil {
+		t.Fatalf("seed Add: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	got, err := c.ContainerInspect(ctx, id)
+	if err != nil {
+		t.Fatalf("ContainerInspect: %v", err)
+	}
+
+	if got.ID != id {
+		t.Errorf("ID: got %q, want %q", got.ID, id)
+	}
+	if got.Image != "alpine:3.19" {
+		t.Errorf("Image: got %q", got.Image)
+	}
+	// Path/Args split: argv[0] and argv[1:]
+	if got.Path != "sh" {
+		t.Errorf("Path: got %q, want %q", got.Path, "sh")
+	}
+	if len(got.Args) != 2 || got.Args[0] != "-c" || got.Args[1] != "echo hi" {
+		t.Errorf("Args: got %v, want [-c echo hi]", got.Args)
+	}
+	if got.IPAddress != "172.42.0.2" {
+		t.Errorf("IPAddress: got %q", got.IPAddress)
+	}
+	// Nested State object carries the Running boolean + PID.
+	if !got.State.Running {
+		t.Error("State.Running: got false, want true")
+	}
+	if got.State.Pid != 4242 {
+		t.Errorf("State.Pid: got %d, want 4242", got.State.Pid)
+	}
+	if len(got.Env) != 1 || got.Env[0] != "FOO=bar" {
+		t.Errorf("Env: got %v", got.Env)
+	}
+	// Created timestamp should round-trip as RFC3339 UTC.
+	if _, err := time.Parse(time.RFC3339, got.Created); err != nil {
+		t.Errorf("Created %q: not parseable as RFC3339: %v", got.Created, err)
+	}
+}
+
+// TestContainerInspect_NotFound: unknown id -> 404 surfaced by the
+// client as an error whose message includes the status. Parallels
+// the NotFound test shape used elsewhere in this file.
+func TestContainerInspect_NotFound(t *testing.T) {
+	c, _ := newTestDaemon(t, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := c.ContainerInspect(ctx, "nonexistentid")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("error %q: expected 404 in message", err.Error())
+	}
+}

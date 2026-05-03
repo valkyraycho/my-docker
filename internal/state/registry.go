@@ -151,20 +151,10 @@ func (r *Registry) Remove(id string) error {
 	return nil
 }
 
-// List is a convenience function that creates a one-shot Registry from disk
-// and returns all containers. Intended for CLI commands that do not hold a
-// long-lived Registry.
-func List() ([]*Container, error) {
-	r, err := NewRegistry()
-	if err != nil {
-		return nil, err
-	}
-	return r.List()
-}
-
 // Find is a convenience function that creates a one-shot Registry from disk
-// and delegates to Registry.Find. Intended for CLI commands that do not hold a
-// long-lived Registry.
+// and delegates to Registry.Find. Temporary shim for CLI commands (logs/stop/rm)
+// that haven't been routed through the daemon yet; scheduled for deletion
+// when chunk 2 steps 5–6 rewire them through the client.
 func Find(prefix string) (*Container, error) {
 	r, err := NewRegistry()
 	if err != nil {
