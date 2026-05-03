@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/valkyraycho/my-docker/internal/daemon"
+	"github.com/valkyraycho/my-docker/internal/state"
 	"golang.org/x/sys/unix"
 )
 
@@ -33,7 +36,19 @@ func run() int {
 		return 2
 	}
 
-	s := daemon.New(socketPath)
+	registry, err := state.NewRegistry()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load state: %v\n", err)
+		return 1
+	}
+
+	deps := &daemon.Deps{
+		Registry: registry,
+	}
+
+	handler := daemon.NewHandler(deps)
+
+	s := daemon.New(socketPath, handler)
 
 	ctx, stop := signal.NotifyContext(context.Background(), unix.SIGINT, unix.SIGTERM)
 	defer stop()

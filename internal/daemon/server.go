@@ -1,3 +1,5 @@
+//go:build linux
+
 package daemon
 
 import (
@@ -15,10 +17,10 @@ type Server struct {
 	listener   net.Listener
 }
 
-func New(socketPath string) *Server {
+func New(socketPath string, handler http.Handler) *Server {
 	return &Server{
 		socketPath: socketPath,
-		httpServer: &http.Server{Handler: NewHandler()},
+		httpServer: &http.Server{Handler: handler},
 	}
 }
 

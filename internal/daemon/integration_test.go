@@ -1,3 +1,5 @@
+//go:build linux
+
 package daemon_test
 
 import (
@@ -26,7 +28,7 @@ import (
 func TestEndToEnd_Ping(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "mydocker.sock")
 
-	s := daemon.New(socketPath)
+	s := daemon.New(socketPath, daemon.NewHandler(nil))
 
 	// Start the server in a goroutine; Start blocks until Shutdown.
 	// Buffered channel so the goroutine can always send-and-exit,

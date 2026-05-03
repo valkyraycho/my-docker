@@ -1,3 +1,5 @@
+//go:build linux
+
 package daemon
 
 import (
@@ -6,9 +8,10 @@ import (
 	"github.com/valkyraycho/my-docker/internal/api"
 )
 
-func NewHandler() http.Handler {
+func NewHandler(deps *Deps) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_ping", handlePing)
+	_ = deps
 	return mux
 }
 

@@ -1,3 +1,5 @@
+//go:build linux
+
 package daemon
 
 import (
@@ -54,7 +56,7 @@ func TestHandlePing_Direct(t *testing.T) {
 // that path, which the Direct test cannot check because it calls
 // handlePing directly and bypasses the router.
 func TestNewHandler_PingRouted(t *testing.T) {
-	srv := httptest.NewServer(NewHandler())
+	srv := httptest.NewServer(NewHandler(nil))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/_ping")
@@ -76,7 +78,7 @@ func TestNewHandler_PingRouted(t *testing.T) {
 // patterns ("GET /_ping") provide this automatically; we lock it in
 // so a future refactor to an unscoped pattern would fail CI.
 func TestNewHandler_WrongMethod(t *testing.T) {
-	srv := httptest.NewServer(NewHandler())
+	srv := httptest.NewServer(NewHandler(nil))
 	defer srv.Close()
 
 	resp, err := http.Post(srv.URL+"/_ping", "text/plain", nil)
@@ -93,7 +95,7 @@ func TestNewHandler_WrongMethod(t *testing.T) {
 // TestNewHandler_UnknownPath asserts unregistered paths return 404.
 // Safety net against a future route accidentally acting as a catch-all.
 func TestNewHandler_UnknownPath(t *testing.T) {
-	srv := httptest.NewServer(NewHandler())
+	srv := httptest.NewServer(NewHandler(nil))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/does-not-exist")
