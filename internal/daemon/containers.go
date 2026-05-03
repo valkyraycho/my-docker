@@ -76,6 +76,7 @@ func (d *Deps) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: time.Now(),
 		Volumes:   volumes,
 		Ports:     ports,
+		Env:       req.Env,
 	}
 
 	if err := d.Registry.Add(&container); err != nil {

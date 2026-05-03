@@ -56,6 +56,8 @@ type Container struct {
 	Volumes []*volume.Spec `json:"volumes,omitempty"`
 
 	Ports []*network.PortSpec `json:"ports,omitempty"`
+
+	Env []string `json:"env,omitempty"`
 }
 
 // Save serializes c to <containersDir>/<id>/state.json using a tmp+rename for
@@ -119,4 +121,8 @@ func StderrPath(id string) string {
 // RemoveDir deletes the entire state directory for the given container ID.
 func RemoveDir(id string) error {
 	return os.RemoveAll(containerStateDir(id))
+}
+
+func (c *Container) EnvForExec() []string {
+	return append(os.Environ(), c.Env...)
 }
