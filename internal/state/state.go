@@ -14,6 +14,7 @@ import (
 )
 
 const (
+	StatusCreated = "created"
 	StatusRunning = "running"
 	StatusExited  = "exited"
 )
