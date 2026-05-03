@@ -10,8 +10,12 @@ import (
 	"github.com/valkyraycho/my-docker/internal/container"
 )
 
+// stopTimeout is set by the -t flag; it controls how long to wait for a
+// graceful SIGTERM before escalating to SIGKILL.
 var stopTimeout time.Duration
 
+// stopCmd implements "mydocker stop". It sends SIGTERM to the container and
+// waits up to -t (default container.DefaultStopTimeout) before sending SIGKILL.
 var stopCmd = &cobra.Command{
 	Use:   "stop [flags] <id>",
 	Short: "Stop a running container",

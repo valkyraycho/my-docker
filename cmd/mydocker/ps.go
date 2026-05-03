@@ -9,8 +9,11 @@ import (
 	"github.com/valkyraycho/my-docker/internal/container"
 )
 
+// psShowAll is set by the -a flag; when true, stopped containers are included.
 var psShowAll bool
 
+// psCmd implements "mydocker ps". By default only running containers are shown;
+// pass -a to include stopped containers.
 var psCmd = &cobra.Command{
 	Use:   "ps",
 	Short: "List containers",

@@ -10,6 +10,8 @@ import (
 	"github.com/valkyraycho/my-docker/internal/registry"
 )
 
+// pullCmd implements "mydocker pull". It fetches the image manifest and layer
+// blobs from the default registry and stores them in the local image store.
 var pullCmd = &cobra.Command{
 	Use:   "pull <image>[:<tag>]",
 	Short: "Pull an image from a registry",

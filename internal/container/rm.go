@@ -13,6 +13,12 @@ import (
 	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
+// Rm removes a stopped container and releases all its resources: volume bind
+// mounts, the overlay filesystem, the cgroup directory, the state directory,
+// and any network interfaces and iptables rules. If force is true and the
+// container is still running, Stop is called first. Errors from each teardown
+// step are accumulated with errors.Join so a single failure doesn't prevent
+// the remaining cleanup.
 func Rm(prefix string, force bool) error {
 	c, err := state.Find(prefix)
 	if err != nil {

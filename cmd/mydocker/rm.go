@@ -9,8 +9,12 @@ import (
 	"github.com/valkyraycho/my-docker/internal/container"
 )
 
+// rmForce is set by the -f flag; when true, a running container is stopped
+// before removal.
 var rmForce bool
 
+// rmCmd implements "mydocker rm". With -f it stops a running container before
+// removing it; without -f it returns an error if the container is still running.
 var rmCmd = &cobra.Command{
 	Use:   "rm [flags] <id>",
 	Short: "Remove a container",

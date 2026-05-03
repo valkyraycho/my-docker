@@ -10,8 +10,13 @@ import (
 	"github.com/valkyraycho/my-docker/internal/registry"
 )
 
+// DefaultRegistry is the Docker Hub registry used when no host is specified in
+// an image ref.
 const DefaultRegistry = "registry-1.docker.io"
 
+// parseRef splits a human-readable image ref (e.g. "alpine:3.19") into a
+// fully-qualified repo and tag. Bare names like "alpine" are expanded to
+// "library/alpine"; missing tags default to "latest".
 func parseRef(ref string) (string, string) {
 	repo, tag, ok := strings.Cut(ref, ":")
 	if !ok {
@@ -25,6 +30,10 @@ func parseRef(ref string) (string, string) {
 	return repo, tag
 }
 
+// Pull orchestrates a full image pull for the given ref. It resolves the ref,
+// fetches the manifest (following an index to select the current platform when
+// needed), downloads and verifies each blob, extracts layers into the cache,
+// and saves image metadata to disk.
 func (s *Store) Pull(client *registry.Client, ref string) error {
 	repo, tag := parseRef(ref)
 	if err := s.EnsureDirs(); err != nil {
@@ -89,6 +98,8 @@ func (s *Store) Pull(client *registry.Client, ref string) error {
 	return nil
 }
 
+// matchPlatform finds the manifest descriptor in index that matches the current
+// runtime OS and architecture (e.g. linux/amd64). Returns nil if no match.
 func matchPlatform(index *registry.Index) *registry.Descriptor {
 	for i := range index.Manifests {
 		m := &index.Manifests[i]

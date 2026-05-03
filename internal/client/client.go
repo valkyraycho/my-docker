@@ -1,3 +1,6 @@
+// Package client is the Go library the CLI uses to talk to the mydocker daemon.
+// It wraps each daemon HTTP endpoint in a typed method so callers never
+// construct raw HTTP requests directly.
 package client
 
 import (
@@ -12,13 +15,20 @@ import (
 	"github.com/valkyraycho/my-docker/internal/api"
 )
 
+// Client communicates with the mydocker daemon over a UNIX socket.
+// All methods accept a context so callers can apply deadlines or cancellation.
 type Client struct {
 	socketPath string
 	httpClient *http.Client
 }
 
+// dummyHost is a placeholder base URL used when constructing http.Request URLs.
+// The HTTP transport ignores the host entirely and dials the UNIX socket instead.
 const dummyHost = "http://unix"
 
+// New returns a Client that dials socketPath for every request.
+// The underlying http.Transport is configured to ignore the host in the URL
+// and connect over the UNIX socket instead.
 func New(socketPath string) *Client {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -31,12 +41,17 @@ func New(socketPath string) *Client {
 	}
 }
 
+// PingResult holds the capability fields extracted from a GET /_ping response.
+// Docker returns these as HTTP headers, not a JSON body; we surface them here
+// as a typed struct so the CLI can branch on APIVersion or OSType.
 type PingResult struct {
 	APIVersion     string
 	OSType         string
 	BuilderVersion string
 }
 
+// Ping calls GET /_ping and returns the daemon's API version, OS type, and
+// builder version. It is used at startup to verify the daemon is reachable.
 func (c *Client) Ping(ctx context.Context) (*PingResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, dummyHost+"/_ping", nil)
 	if err != nil {
@@ -63,6 +78,9 @@ func (c *Client) Ping(ctx context.Context) (*PingResult, error) {
 	return &result, nil
 }
 
+// ContainerCreate calls POST /containers/create with req as the JSON body.
+// On success (201 Created) it returns the new container's ID and any warnings.
+// Non-201 responses are decoded as an ErrorResponse and returned as an error.
 func (c *Client) ContainerCreate(ctx context.Context, req *api.ContainerCreateRequest) (*api.ContainerCreateResponse, error) {
 	data, err := json.Marshal(req)
 	if err != nil {

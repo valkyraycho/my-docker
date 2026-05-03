@@ -11,16 +11,24 @@ import (
 )
 
 const (
-	subnet    = "172.42.0.0/24"
+	// subnet is the /24 block from which container IPs are handed out.
+	subnet = "172.42.0.0/24"
+	// gatewayIP is the bridge address — it is reserved and never allocated to a container.
 	gatewayIP = "172.42.0.1"
+	// allocFile is the JSON file that persists the containerID→IP mapping across daemon restarts.
 	allocFile = "/var/lib/mydocker/network/allocated_ips.json"
 )
 
+// allocation records a single containerID→IP lease persisted in allocFile.
 type allocation struct {
 	ContainerID string `json:"container_id"`
 	IP          string `json:"ip"`
 }
 
+// AllocateIP picks the first free IP in the subnet (skipping the gateway) and
+// records the containerID→IP lease in allocFile. The allocation is written
+// atomically via a temp-file rename to avoid corruption on concurrent writes.
+// Returns the allocated IP string (e.g. "172.42.0.2").
 func AllocateIP(containerID string) (string, error) {
 	allocations, err := readIPAllocations()
 	if err != nil {
@@ -61,6 +69,9 @@ func AllocateIP(containerID string) (string, error) {
 	return picked, nil
 }
 
+// writeAllocations serializes the allocation slice to allocFile using an
+// atomic write (write to .tmp, then rename) so a crash mid-write cannot
+// leave a partially written JSON file.
 func writeAllocations(allocations []allocation) error {
 	if err := os.MkdirAll(filepath.Dir(allocFile), 0755); err != nil {
 		return fmt.Errorf("mkdir allocation dir: %w", err)
@@ -81,6 +92,8 @@ func writeAllocations(allocations []allocation) error {
 	return nil
 }
 
+// readIPAllocations loads current leases from allocFile. A missing file is
+// treated as an empty pool (first-run case), not an error.
 func readIPAllocations() ([]allocation, error) {
 	b, err := os.ReadFile(allocFile)
 	if err != nil {
@@ -100,6 +113,9 @@ func readIPAllocations() ([]allocation, error) {
 	return allocations, nil
 }
 
+// ipRange returns all assignable host IPs in cidr, excluding the network
+// address, broadcast address, and the gateway IP. For a /24 that is up to 253
+// addresses (.2–.254, skipping .1 which is the gateway).
 func ipRange(cidr string) ([]string, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -127,6 +143,8 @@ func ipRange(cidr string) ([]string, error) {
 	}
 	return result, nil
 }
+// ReleaseIP removes the lease for containerID from allocFile, returning the IP
+// to the free pool for future containers.
 func ReleaseIP(containerID string) error {
 	allocations, err := readIPAllocations()
 	if err != nil {

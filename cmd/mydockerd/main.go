@@ -1,5 +1,8 @@
 //go:build linux
 
+// Package main is the entry point for mydockerd, the container daemon.
+// It listens on a UNIX socket (default /var/run/mydocker.sock), handles HTTP
+// API requests from the mydocker CLI, and shuts down gracefully on SIGINT/SIGTERM.
 package main
 
 import (
@@ -18,14 +21,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// defaultHost is the UNIX socket address the daemon binds to by default.
 const defaultHost = "unix:///var/run/mydocker.sock"
 
+// shutdownTimeout is how long the daemon waits for in-flight requests to
+// finish before it forcefully closes the listener on SIGINT/SIGTERM.
 const shutdownTimeout = 15 * time.Second
 
 func main() {
 	os.Exit(run())
 }
 
+// run is the real main body, split out so it can return an exit code that
+// main() passes to os.Exit. This pattern avoids deferred calls being skipped
+// when os.Exit is called directly inside main.
 func run() int {
 	var hostFlag string
 	flag.StringVar(&hostFlag, "H", defaultHost, "Daemon socket to connect to")
@@ -89,6 +98,9 @@ func run() int {
 	}
 
 }
+// parseHost strips the "unix://" scheme prefix and returns the bare socket
+// path. It rejects non-unix schemes because the daemon only binds to a local
+// UNIX socket.
 func parseHost(host string) (string, error) {
 	const prefix = "unix://"
 	if !strings.HasPrefix(host, prefix) {

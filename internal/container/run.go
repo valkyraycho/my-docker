@@ -1,5 +1,8 @@
 //go:build linux
 
+// Package container implements the high-level container lifecycle operations:
+// run, init, stop, rm, ps, and logs. Each operation coordinates the lower-level
+// subsystems (overlay, cgroup, network, volume) that together form a container.
 package container
 
 import (
@@ -16,6 +19,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// RunOptions carries all parameters the parent process needs to launch a container.
+// It is populated by the daemon handler and passed into Run.
 type RunOptions struct {
 	ContainerID string
 	Image       string
@@ -29,6 +34,13 @@ type RunOptions struct {
 	Ports       []*network.PortSpec
 }
 
+// Run is the parent-side entrypoint for "mydocker run". It mounts volumes,
+// creates the cgroup, then re-execs /proc/self/exe with "init" as its first
+// argument inside new namespaces (CLONE_NEWPID|CLONE_NEWNS|CLONE_NEWUTS|
+// CLONE_NEWIPC|CLONE_NEWNET). A pipe synchronises the two sides: the child
+// blocks on the read end until the parent has written its PID into the cgroup
+// and saved container state, at which point the pipe is closed and the child
+// proceeds to set up mounts and exec the user command.
 func Run(opts RunOptions) error {
 	cmd := exec.Command("/proc/self/exe", append([]string{"init", opts.Rootfs}, opts.Args...)...)
 	cmd.SysProcAttr = &unix.SysProcAttr{

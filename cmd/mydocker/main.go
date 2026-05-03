@@ -1,5 +1,8 @@
 //go:build linux
 
+// Package main is the CLI entry point for the mydocker client.
+// It wires up all subcommands under the root cobra command and owns
+// top-level error printing so subcommands don't double-report failures.
 package main
 
 import (
@@ -11,6 +14,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// rootCmd is the top-level cobra command ("mydocker"). All subcommands are
+// registered as children in main().
 var rootCmd = &cobra.Command{
 	Use:          "mydocker",
 	Short:        "A minimal container runtime, for learning",

@@ -1,5 +1,10 @@
 //go:build linux
 
+// Package overlay manages OverlayFS mounts for container filesystems.
+// Each container gets a stack of read-only image layers (lowerdir) combined
+// with a writable upperdir; all changes go to upper so the image layers are
+// never modified. A workdir is required by the kernel for internal OverlayFS
+// bookkeeping. The merged view is what the container sees as its root.
 package overlay
 
 import (
@@ -21,6 +26,10 @@ const (
 	containersDir = "/var/lib/mydocker/containers"
 )
 
+// EnsureRoot creates the on-disk directory layout under /var/lib/mydocker and
+// mounts a tmpfs over the containers directory. Tmpfs is used so that overlay
+// upper/work/merged dirs are automatically cleaned up on reboot, preventing
+// stale mounts from accumulating across daemon restarts.
 func EnsureRoot() error {
 	for _, d := range []string{root, layersDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
@@ -46,6 +55,8 @@ func EnsureRoot() error {
 	return nil
 }
 
+// isTmpfs reports whether path is already mounted as a tmpfs by parsing
+// /proc/mounts, avoiding a redundant mount call on daemon restart.
 func isTmpfs(path string) (bool, error) {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
@@ -70,6 +81,10 @@ func isTmpfs(path string) (bool, error) {
 
 }
 
+// Mount assembles an OverlayFS for containerID from the given image layer
+// names. Layers are ordered so the first name (top of the Docker image stack)
+// maps to the highest-priority lowerdir. Returns the path to the merged
+// directory, which becomes the container's rootfs.
 func Mount(containerID string, layerNames []string) (string, error) {
 	for _, name := range layerNames {
 		layer := filepath.Join(layersDir, name)
@@ -115,6 +130,9 @@ func Mount(containerID string, layerNames []string) (string, error) {
 	return mergedPath, nil
 }
 
+// Unmount lazily detaches the overlay merged mount for containerID.
+// MNT_DETACH allows unmounting even if files inside are still open,
+// which is safe here because the container process has already exited.
 func Unmount(containerID string) error {
 	containerDir := filepath.Join(containersDir, containerID)
 	mergedPath := filepath.Join(containerDir, "merged")
@@ -124,6 +142,9 @@ func Unmount(containerID string) error {
 	return nil
 }
 
+// MergedPath returns the path to the overlay merged directory for containerID.
+// Other packages use this as the rootfs path when mounting volumes or
+// performing pivot_root.
 func MergedPath(containerID string) string {
 	return filepath.Join(containersDir, containerID, "merged")
 }

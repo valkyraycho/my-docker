@@ -11,6 +11,8 @@ import (
 	"github.com/valkyraycho/my-docker/internal/state"
 )
 
+// inspectCmd implements "mydocker inspect". It loads the persisted state for
+// the given container ID and pretty-prints it as indented JSON.
 var inspectCmd = &cobra.Command{
 	Use:   "inspect <id>",
 	Short: "Display detailed information about a container",

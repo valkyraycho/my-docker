@@ -13,6 +13,9 @@ import (
 	"github.com/valkyraycho/my-docker/internal/state"
 )
 
+// Ps writes a tabular container listing to w. It reconciles stale "running"
+// state by checking whether each PID is still alive before rendering; showAll
+// includes exited containers in the output, mirroring "docker ps -a".
 func Ps(w io.Writer, showAll bool) error {
 	containers, err := state.List()
 	if err != nil {
@@ -42,6 +45,8 @@ func Ps(w io.Writer, showAll bool) error {
 	return tabWriter.Flush()
 }
 
+// shortID returns the first 12 hex characters of a container ID, matching
+// Docker's default display format.
 func shortID(id string) string {
 	if len(id) > 12 {
 		return id[:12]
@@ -49,6 +54,8 @@ func shortID(id string) string {
 	return id
 }
 
+// sinceFormatted returns a human-readable age string ("30s ago", "5m ago", etc.)
+// for the given timestamp, similar to Docker's CREATED column.
 func sinceFormatted(t time.Time) string {
 	d := time.Since(t)
 	switch {

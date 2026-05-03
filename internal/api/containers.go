@@ -1,3 +1,7 @@
+// Package api defines the wire types shared between the daemon and the client.
+// Each type corresponds to an HTTP route; field names and JSON tags deliberately
+// match Docker's Engine API so that the two can be compared and eventually
+// made interoperable.
 package api
 
 // ContainerCreateRequest is the JSON body for POST /containers/create.

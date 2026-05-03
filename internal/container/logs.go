@@ -10,6 +10,9 @@ import (
 	"github.com/valkyraycho/my-docker/internal/state"
 )
 
+// Logs streams the saved stdout log of a detached container to w. Foreground
+// containers inherit the daemon's stdio directly and produce no log file, so
+// this returns a descriptive error for them.
 func Logs(w io.Writer, prefix string) error {
 	c, err := state.Find(prefix)
 	if err != nil {

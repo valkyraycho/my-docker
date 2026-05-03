@@ -20,6 +20,11 @@ import (
 	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
+// handleContainerCreate implements POST /containers/create. It decodes a
+// ContainerCreateRequest, resolves the image to its layer paths, parses
+// volume and port specs, allocates a random container ID, persists the
+// container to the registry, and responds 201 with a ContainerCreateResponse.
+// Returns 400 for malformed input, 404 if the image is not found, 500 otherwise.
 func (d *Deps) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	var req api.ContainerCreateRequest
 
@@ -84,6 +89,8 @@ func (d *Deps) handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// newContainerID returns a 12-character lowercase hex string derived from 6
+// cryptographically random bytes. Panics if the OS CSPRNG is unavailable.
 func newContainerID() string {
 	buf := make([]byte, 6)
 
@@ -94,16 +101,21 @@ func newContainerID() string {
 	return hex.EncodeToString(buf)
 }
 
+// writeJSON sets Content-Type to application/json, writes statusCode, and
+// encodes v as JSON into the response body.
 func writeJSON(w http.ResponseWriter, statusCode int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeError writes an api.ErrorResponse JSON body with the given status code.
 func writeError(w http.ResponseWriter, statusCode int, err error) {
 	writeJSON(w, statusCode, api.ErrorResponse{Message: err.Error()})
 }
 
+// statusForError maps known sentinel errors to HTTP status codes,
+// falling back to 500 for anything unexpected.
 func statusForError(err error) int {
 	switch {
 	case errors.Is(err, state.ErrNotFound):

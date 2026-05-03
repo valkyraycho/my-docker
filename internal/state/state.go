@@ -1,5 +1,8 @@
 //go:build linux
 
+// Package state owns the on-disk representation of containers under
+// /var/lib/mydocker/containers/<id>/state.json, plus an in-memory registry
+// that loads and caches those records at daemon start-up.
 package state
 
 import (
@@ -13,6 +16,7 @@ import (
 	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
+// Container lifecycle status values stored in state.json.
 const (
 	StatusCreated = "created"
 	StatusRunning = "running"
@@ -21,6 +25,14 @@ const (
 
 var containersDir = "/var/lib/mydocker/containers"
 
+// Container is the persisted record of one mydocker container. It is written
+// atomically (write to ".tmp" then rename) on every state transition so a
+// crash never leaves a torn state.json on disk.
+//
+// A container is uniquely identified by the (PID, StartTime) tuple, not PID
+// alone. Linux reuses PIDs after a process exits, so storing StartTime (read
+// from /proc/<pid>/stat field 22 in jiffies) lets us confirm we are still
+// looking at the original process and not an unrelated recycled PID.
 type Container struct {
 	// Identity
 	ID      string   `json:"id"`      // 12-char hex, generated at run-time
@@ -46,6 +58,8 @@ type Container struct {
 	Ports []*network.PortSpec `json:"ports,omitempty"`
 }
 
+// Save serializes c to <containersDir>/<id>/state.json using a tmp+rename for
+// atomicity. Safe to call whenever state changes (create, start, stop).
 func (c *Container) Save() error {
 	d := containerStateDir(c.ID)
 	if err := os.MkdirAll(d, 0755); err != nil {
@@ -69,6 +83,9 @@ func (c *Container) Save() error {
 	return nil
 }
 
+// Load reads and deserializes the state.json for the container with the given
+// ID. Returns an error wrapping os.ErrNotExist if the container directory does
+// not exist.
 func Load(id string) (*Container, error) {
 	statePath := filepath.Join(containerStateDir(id), "state.json")
 
@@ -89,13 +106,17 @@ func containerStateDir(id string) string {
 	return filepath.Join(containersDir, id)
 }
 
+// StdoutPath returns the path to the captured stdout log for a container.
 func StdoutPath(id string) string {
 	return filepath.Join(containersDir, id, "stdout.log")
 }
+
+// StderrPath returns the path to the captured stderr log for a container.
 func StderrPath(id string) string {
 	return filepath.Join(containersDir, id, "stderr.log")
 }
 
+// RemoveDir deletes the entire state directory for the given container ID.
 func RemoveDir(id string) error {
 	return os.RemoveAll(containerStateDir(id))
 }

@@ -6,6 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// versionCmd implements "mydocker version". It contacts the daemon via the
+// configured UNIX socket, calls the ping endpoint, and prints the API version,
+// OS type, and optional builder version reported by the daemon.
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Show the mydockerd daemon version and capabilities",

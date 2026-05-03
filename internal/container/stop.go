@@ -12,8 +12,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// DefaultStopTimeout is the grace period between SIGTERM and SIGKILL.
+// This matches Docker's default: give the process 10 s to clean up before
+// forcibly killing it.
 const DefaultStopTimeout = 10 * time.Second
 
+// Stop sends SIGTERM to the container's init process and waits up to timeout
+// for a graceful exit. If the process is still alive, it sends SIGKILL and
+// waits briefly before marking the container as exited.
 func Stop(prefix string, timeout time.Duration) error {
 	c, err := state.Find(prefix)
 	if err != nil {
@@ -44,6 +50,9 @@ func Stop(prefix string, timeout time.Duration) error {
 	return reconcileExited(c)
 }
 
+// reconcileExited marks the container's persisted state as exited. It is called
+// both when the container stopped on its own and after a forced kill, so state
+// is always consistent regardless of how the process ended.
 func reconcileExited(c *state.Container) error {
 	c.Status = state.StatusExited
 	c.FinishedAt = time.Now()
@@ -54,6 +63,8 @@ func reconcileExited(c *state.Container) error {
 	return nil
 }
 
+// waitForExit polls IsRunning every 100 ms until the process exits or the
+// timeout elapses. Returns true if the process exited within the deadline.
 func waitForExit(c *state.Container, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

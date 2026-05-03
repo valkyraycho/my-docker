@@ -11,13 +11,21 @@ import (
 	"sync"
 )
 
+// ErrNotFound is returned when a container ID or prefix has no match.
 var ErrNotFound = errors.New("container not found")
 
+// Registry is an in-memory cache of all known containers, backed by the
+// directory structure under /var/lib/mydocker/containers. It is loaded once
+// at daemon start-up by NewRegistry and kept in sync via Add, Update, and
+// Remove. All methods are safe for concurrent use.
 type Registry struct {
 	mu         sync.RWMutex
 	containers map[string]*Container
 }
 
+// NewRegistry scans containersDir, loads every valid state.json it finds, and
+// returns a populated Registry. Missing or unreadable state files are logged
+// and skipped rather than treated as fatal errors.
 func NewRegistry() (*Registry, error) {
 	containers := make(map[string]*Container)
 	entries, err := os.ReadDir(containersDir)
@@ -42,6 +50,7 @@ func NewRegistry() (*Registry, error) {
 	return &Registry{containers: containers}, nil
 }
 
+// List returns all containers currently held in the registry.
 func (r *Registry) List() ([]*Container, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -52,6 +61,9 @@ func (r *Registry) List() ([]*Container, error) {
 	return all, nil
 }
 
+// Find returns the unique container whose ID starts with prefix, mirroring the
+// Docker short-ID UX. Returns ErrNotFound if no container matches and an error
+// listing the ambiguous IDs if more than one matches.
 func (r *Registry) Find(prefix string) (*Container, error) {
 	if prefix == "" {
 		return nil, errors.New("empty prefix")
@@ -83,6 +95,7 @@ func (r *Registry) Find(prefix string) (*Container, error) {
 	}
 }
 
+// Get returns the container with the exact given ID, or ErrNotFound.
 func (r *Registry) Get(id string) (*Container, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -93,6 +106,8 @@ func (r *Registry) Get(id string) (*Container, error) {
 	return c, nil
 }
 
+// Add persists c to disk via c.Save and inserts it into the in-memory map.
+// Returns an error if a container with the same ID already exists.
 func (r *Registry) Add(c *Container) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -106,6 +121,8 @@ func (r *Registry) Add(c *Container) error {
 	return nil
 }
 
+// Update persists c to disk via c.Save and replaces the in-memory entry.
+// Returns ErrNotFound if the container does not exist in the registry.
 func (r *Registry) Update(c *Container) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -119,6 +136,8 @@ func (r *Registry) Update(c *Container) error {
 	return nil
 }
 
+// Remove deletes the container from the in-memory map and removes its state
+// directory from disk. Returns ErrNotFound if the ID is unknown.
 func (r *Registry) Remove(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -132,6 +151,9 @@ func (r *Registry) Remove(id string) error {
 	return nil
 }
 
+// List is a convenience function that creates a one-shot Registry from disk
+// and returns all containers. Intended for CLI commands that do not hold a
+// long-lived Registry.
 func List() ([]*Container, error) {
 	r, err := NewRegistry()
 	if err != nil {
@@ -140,6 +162,9 @@ func List() ([]*Container, error) {
 	return r.List()
 }
 
+// Find is a convenience function that creates a one-shot Registry from disk
+// and delegates to Registry.Find. Intended for CLI commands that do not hold a
+// long-lived Registry.
 func Find(prefix string) (*Container, error) {
 	r, err := NewRegistry()
 	if err != nil {

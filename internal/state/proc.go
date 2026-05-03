@@ -9,6 +9,11 @@ import (
 	"strings"
 )
 
+// ReadStartTime reads field 22 of /proc/<pid>/stat, which is the process start
+// time expressed in clock ticks (jiffies) since system boot. This value is
+// stable for the lifetime of the process and is used together with PID to
+// detect PID reuse: if a new process has inherited the same PID but its
+// StartTime differs, the original container process is gone.
 func ReadStartTime(pid int) (uint64, error) {
 	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
@@ -35,6 +40,9 @@ func ReadStartTime(pid int) (uint64, error) {
 	return startTime, nil
 }
 
+// IsRunning reports whether the process with the given PID is still the same
+// process that was recorded with wantStart. Returns false if the process has
+// exited or if a different process has recycled the PID.
 func IsRunning(pid int, wantStart uint64) bool {
 	gotStart, err := ReadStartTime(pid)
 	if err != nil {

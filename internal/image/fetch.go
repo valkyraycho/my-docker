@@ -14,6 +14,11 @@ import (
 	"github.com/valkyraycho/my-docker/internal/registry"
 )
 
+// FetchBlob downloads the blob identified by expectedDigest from the registry
+// and stores it at BlobPath. It is a no-op if the blob is already cached.
+// The download is written to a ".tmp" file first and renamed on success;
+// the SHA-256 digest is verified before the rename so a partial download is
+// never promoted to the cache.
 func (s *Store) FetchBlob(client *registry.Client, repo, expectedDigest string) error {
 	if s.HasBlob(expectedDigest) {
 		return nil
@@ -70,6 +75,10 @@ func (s *Store) FetchBlob(client *registry.Client, repo, expectedDigest string) 
 	return nil
 }
 
+// ExtractLayer decompresses the gzipped-tar blob for digest into LayerPath.
+// It is a no-op if the layer directory already exists. Extraction goes into a
+// ".tmp" sibling directory that is renamed atomically on success; a deferred
+// cleanup removes it if any error occurs mid-extraction.
 func (s *Store) ExtractLayer(digest string) (retErr error) {
 
 	if s.HasLayer(digest) {

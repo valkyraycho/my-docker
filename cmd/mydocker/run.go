@@ -20,6 +20,8 @@ import (
 	"github.com/valkyraycho/my-docker/internal/volume"
 )
 
+// Flag variables for runCmd. Each maps to a cobra flag registered in the
+// init() below.
 var (
 	runMemMB   int
 	runCPUPct  int
@@ -30,6 +32,12 @@ var (
 	runPorts   []string
 )
 
+// runCmd implements "mydocker run". It resolves the image locally (pulling
+// automatically if missing), mounts an overlay filesystem, applies cgroup
+// resource limits, and forks the container process. With -d the container runs
+// in the background and only the container ID is printed; without -d stdout/
+// stderr stream to the terminal. Flags: -m memory, --cpu, --pids, -d detach,
+// -v volume, -e env, -p port publish.
 var runCmd = &cobra.Command{
 	Use:   "run [flags] <image> <cmd> [args...]",
 	Short: "Run a command in a new container",
@@ -144,6 +152,7 @@ func init() {
 	f.StringArrayVarP(&runPorts, "publish", "p", nil, "publish port (repeatable): hostPort:containerPort")
 }
 
+// generateID returns a random 12-character hex string used as the container ID.
 func generateID() string {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b)

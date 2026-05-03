@@ -12,6 +12,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Init runs inside the newly created namespaces as the container's PID 1.
+// The kernel re-execed this binary after clone; Init completes the isolation:
+// it blocks on the sync pipe until the parent finishes cgroup setup, then sets
+// the hostname, calls pivot_root to switch the filesystem root to the overlay
+// merged dir, mounts /proc, /dev, and /sys, and finally starts the user command.
+// Because we are PID 1 inside CLONE_NEWPID, we must reap all orphaned children
+// (reapUntilDirectExits) — otherwise zombie processes would accumulate.
 func Init(rootfs string, args []string) error {
 	if err := waitForParent(); err != nil {
 		return fmt.Errorf("wait for parent: %w", err)
@@ -69,6 +76,10 @@ func Init(rootfs string, args []string) error {
 	return nil
 }
 
+// reapUntilDirectExits loops over SIGCHLD notifications, calling Wait4 in
+// WNOHANG mode until all pending children are reaped. It returns the exit code
+// only when the direct child exits; other children (grandchildren adopted after
+// their parent died) are reaped and discarded so they don't become zombies.
 func reapUntilDirectExits(directChild int, childCh <-chan os.Signal) int {
 	for range childCh {
 		for {
@@ -95,6 +106,9 @@ func reapUntilDirectExits(directChild int, childCh <-chan os.Signal) int {
 	return 1
 }
 
+// waitForParent drains the sync pipe passed as fd 3 by the parent process.
+// The read blocks until the parent closes its write end, signalling that the
+// cgroup and network setup are complete and it is safe to proceed.
 func waitForParent() error {
 	syncFile := os.NewFile(3, "sync")
 	if syncFile == nil {

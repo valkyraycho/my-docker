@@ -1,5 +1,10 @@
 //go:build linux
 
+// Package cgroup manages cgroup v2 resource limits for containers. Each
+// container gets its own sub-cgroup under /sys/fs/cgroup/mydocker/<id>/.
+// Limits are enforced by writing to the kernel's cgroup interface files
+// (memory.max, cpu.max, pids.max); the kernel applies them immediately when
+// a PID is added to the cgroup via cgroup.procs.
 package cgroup
 
 import (
@@ -27,6 +32,8 @@ type Manager struct {
 	path string // full path: /sys/fs/cgroup/mydocker/<id>
 }
 
+// New returns a Manager for the given container ID. It does not create anything
+// on disk; call Create to allocate the cgroup.
 func New(id string) *Manager {
 	return &Manager{
 		id:   id,
@@ -34,6 +41,11 @@ func New(id string) *Manager {
 	}
 }
 
+// Create allocates the cgroup hierarchy and writes resource limits. It first
+// calls prepareRoot to ensure the root cgroup's controllers are enabled
+// (cgroup v2 requires explicit opt-in via cgroup.subtree_control at each
+// ancestor), then creates the per-container leaf directory and writes only
+// the limits that are non-zero.
 func (m *Manager) Create(l Limits) error {
 	if err := prepareRoot(); err != nil {
 		return fmt.Errorf("prepare root: %w", err)
@@ -73,6 +85,10 @@ func (m *Manager) Create(l Limits) error {
 	return nil
 }
 
+// prepareRoot moves existing root-cgroup processes into an "init" leaf so the
+// root cgroup becomes a non-leaf, which is required before cgroup v2 will allow
+// enabling controllers on it. Without this step, writing to
+// /sys/fs/cgroup/cgroup.subtree_control fails with EBUSY.
 func prepareRoot() error {
 	initCgroup := filepath.Join(root, "init")
 	if err := os.MkdirAll(initCgroup, 0755); err != nil {
@@ -103,6 +119,9 @@ func (m *Manager) AddPID(pid int) error {
 	return writeFile(filepath.Join(m.path, "cgroup.procs"), strconv.Itoa(pid))
 }
 
+// Destroy removes the container's cgroup directory. The kernel only allows
+// rmdir on an empty cgroup (no live PIDs), so this must be called after the
+// container process has exited.
 func (m *Manager) Destroy() error {
 	if err := os.Remove(m.path); err != nil {
 		return fmt.Errorf("remove cgroup %s: %w", m.path, err)
@@ -117,6 +136,10 @@ func writeFile(path, value string) error {
 	return nil
 }
 
+// formatCPU converts a percentage into the "quota period" format expected by
+// cpu.max. For example, 50% becomes "50000 100000": the cgroup may use 50 ms
+// out of every 100 ms period, which caps it at 0.5 CPUs regardless of how
+// many cores the host has.
 func formatCPU(percent int) string {
 	period := 100000
 	quota := period * percent / 100

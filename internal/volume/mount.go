@@ -11,6 +11,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Mount bind-mounts the volume described by spec into the container's rootfs.
+// For Named volumes the data directory is created first via EnsureNamed. Read-
+// only mounts require a two-step syscall: bind-mount first (which is always
+// read-write), then remount with MS_RDONLY — the kernel enforces this order.
 func Mount(spec *Spec, rootfs string) error {
 	var source string
 	switch spec.Kind {
@@ -42,6 +46,9 @@ func Mount(spec *Spec, rootfs string) error {
 	return nil
 }
 
+// Unmount lazily detaches the volume bind mount from the container's rootfs.
+// ENOENT is treated as success so cleanup is idempotent when called after a
+// partial setup failure.
 func Unmount(spec *Spec, rootfs string) error {
 	target := filepath.Join(rootfs, spec.Target)
 

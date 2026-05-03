@@ -1,3 +1,6 @@
+// Package volume parses "-v" flags, resolves named volume paths, and performs
+// bind-mount operations that make host directories (or managed volumes) visible
+// inside a container's overlay merged directory.
 package volume
 
 import (
@@ -8,20 +11,26 @@ import (
 	"strings"
 )
 
+// Kind distinguishes how the volume source should be resolved.
 type Kind int
 
 const (
-	Bind Kind = iota
-	Named
+	Bind  Kind = iota // source is an absolute host path (bind mount)
+	Named             // source is a named or anonymous managed volume
 )
 
+// Spec is a parsed "-v host:container[:ro]" flag — one mount request.
 type Spec struct {
-	Kind     Kind
-	Source   string
-	Target   string
-	ReadOnly bool
+	Kind     Kind   // Bind or Named
+	Source   string // host path (Bind) or volume name (Named)
+	Target   string // absolute path inside the container
+	ReadOnly bool   // true when ":ro" was specified
 }
 
+// Parse decodes a single "-v" flag value into a Spec. Accepted forms:
+//   - "/container/path"       — anonymous named volume mounted at that path
+//   - "name:/container/path"  — named volume
+//   - "/host:/container/path[:ro|:rw]" — bind mount
 func Parse(s string) (*Spec, error) {
 	if !strings.Contains(s, ":") {
 		if !strings.HasPrefix(s, "/") {
@@ -71,6 +80,9 @@ func Parse(s string) (*Spec, error) {
 	return &Spec{Kind: kind, Source: source, Target: target, ReadOnly: readOnly}, nil
 }
 
+// generateAnonymousName creates a random volume name for bare container-path
+// specs (e.g. "-v /data"). This matches Docker's behaviour of auto-creating a
+// named volume when no explicit source is given.
 func generateAnonymousName() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)

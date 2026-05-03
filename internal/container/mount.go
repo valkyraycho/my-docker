@@ -10,6 +10,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// setupRoot performs pivot_root to make rootfs the container's filesystem root.
+// The sequence is: (1) re-mount / as MS_PRIVATE so host mount events don't
+// propagate into the namespace; (2) bind-mount rootfs onto itself so it becomes
+// a mount point (pivot_root requires the new root to be a mount point); (3) call
+// pivot_root, which atomically swaps the root and stashes the old root under
+// .old_root; (4) chdir to "/" so the working directory is valid in the new root;
+// (5) lazy-unmount .old_root so the host filesystem is no longer reachable.
 func setupRoot(rootfs string) error {
 	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
 		return fmt.Errorf("make / private: %w", err)
@@ -44,6 +51,10 @@ func setupRoot(rootfs string) error {
 	return nil
 }
 
+// setupMounts populates the essential virtual filesystems inside the new root.
+// /proc exposes per-process kernel state (required by many tools like ps and top).
+// /dev is a fresh tmpfs so we control exactly which device nodes exist.
+// /sys exposes kernel subsystem state (cgroup info, network stats, etc.).
 func setupMounts() error {
 	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
 		return fmt.Errorf("mount /proc: %w", err)
@@ -60,6 +71,9 @@ func setupMounts() error {
 	return nil
 }
 
+// createDevNodes populates the minimal set of character devices that well-behaved
+// processes expect (null, zero, full, random, urandom, tty). Because /dev is a
+// fresh tmpfs, none of these exist until we mknod them explicitly.
 func createDevNodes() error {
 	nodes := []struct {
 		path  string
