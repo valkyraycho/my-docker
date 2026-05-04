@@ -118,3 +118,17 @@ type MountPoint struct {
 	Destination string `json:"Destination"` // path inside the container
 	RW          bool   `json:"RW"`          // true if read-write (opposite of ReadOnly)
 }
+
+// ContainerLogsOptions is the Go-side bundle for GET /containers/{id}/logs.
+// The client translates it into query parameters; at least one of Stdout/
+// Stderr must be true or the daemon returns 400.
+//
+// Follow is the tail -f mode: after the log file hits EOF the server
+// keeps the connection open and streams new lines as the container
+// writes them. Without Follow the response ends at the current EOF.
+type ContainerLogsOptions struct {
+	Stdout bool
+	Stderr bool
+	Follow bool
+	// Reserved for future Docker-compatibility: Timestamps, Tail, Since, Until.
+}
