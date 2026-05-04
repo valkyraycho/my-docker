@@ -22,6 +22,7 @@ func NewHandler(deps *Deps) http.Handler {
 		mux.HandleFunc("DELETE /containers/{id}", deps.handleContainerRemove)
 		mux.HandleFunc("GET /containers/json", deps.handleContainerList)
 		mux.HandleFunc("GET /containers/{id}/json", deps.handleContainerInspect)
+		mux.HandleFunc("GET /containers/{id}/logs", deps.handleContainerLogs)
 	}
 	return mux
 }
